@@ -1,4 +1,4 @@
-# SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-License-Identifier: MIT
 {
   lib,
   writeShellApplication,
@@ -46,6 +46,6 @@ writeShellApplication {
   meta = with lib; {
     description = "Wrapper that execs the checked-out ch-nix-workspace scripts/flake-sync";
     mainProgram = "flake-sync";
-    license = licenses.gpl3Plus;
+    license = licenses.mit;
   };
 }
