@@ -1,0 +1,1249 @@
+#!/usr/bin/env bash
+# SPDX-License-Identifier: MIT
+#
+# flake-sync — assess and converge the workspace's flake repos in DAG order.
+#
+# The workspace is found from the caller's cwd: the enclosing git repo,
+# walked up to the parent-most repo that tracks it as a submodule (a repo
+# that is nobody's submodule is its own workspace; a cwd outside any git
+# repo is an error).
+#
+# The workspace is a git repo with flake submodules that pin each other via
+# github: inputs in their flake.locks. Convergence means: every repo's local
+# pins point at the current HEAD of the corresponding sibling repo, every
+# repo is pushed, and the workspace's submodule pointers match submodule
+# HEADs. Repos are discovered from .gitmodules; cross-repo pins are detected
+# by matching flake.lock github inputs against submodule remote URLs, so
+# nothing is hardcoded.
+#
+# Pins are advanced with `nix flake lock --override-input <name>
+# github:<owner>/<repo>/<rev>` using the sibling's exact local HEAD, which
+# sidesteps GitHub tarball TTL caching and non-default branches. A pin can
+# therefore only be advanced once its target rev has been pushed, which is
+# what forces the DAG ordering.
+#
+# Before any lock is written, the proposed pin state is validated with
+# `nix flake check --no-write-lock-file --override-input ...` (--check=
+# none|eval|full; eval, evaluation-only, is the default). The full stale
+# set is tried first (one check, and the only trial that can pass pins
+# that must move jointly, e.g. siblings sharing a ch-flake rev); if it
+# fails, stale targets are tried cumulatively in dependency order, and a
+# failing or unpushed target holds back only its own pins: whatever passes
+# advances in one commit and the held-back remainder is reported. The
+# objective is to minimize the number of stale pins, never to bisect a
+# target's history for a partially-newer safe rev. The standalone `check`
+# command runs the same gate against every repo's *current* locks, with no
+# overrides and nothing written — a read-only sweep of the whole system.
+#
+# With --with-external, root-level inputs that aren't siblings (nixpkgs,
+# home-manager, etc.) are managed too: one is stale if `nix flake update
+# <name>` would move its locked rev. The trial lock answering that also
+# resolves the rev such an update lands on, and advancing re-locks with a
+# fixed `--override-input` to exactly that rev — the same mechanism as
+# sibling pins (there is no sibling HEAD, so the trial-resolved rev stands
+# in), so the state the check gate validated is the state that gets
+# locked. External pins have no DAG position and no unpushed-target
+# concept; they join whatever sibling pins pass the same check gate in the
+# same update-pins commit.
+
+set -euo pipefail
+
+usage() {
+  cat <<'EOF'
+Usage: flake-sync <command> [options]
+
+Commands:
+  status      Show git and pin state of every repo, plus pending actions
+  next        Print the next action that would run, without running it
+  step        Run the next ready action (or a specific one, see below)
+  converge    Run ready actions until converged or blocked (with --local:
+              working trees only — advance locks, commit and push nothing)
+  pull        Down-sync from the remotes: fetch, fast-forward the workspace
+              to its upstream, init missing submodules, then re-attach every
+              submodule to its default branch fast-forwarded to the recorded
+              pointer — no detached HEADs left behind. A submodule that is
+              dirty, diverged, or parked on a topic branch is held (and
+              reported) rather than touched; exit 1 if anything held
+  check       Run `nix flake check` on every repo (or one: `check <repo>`)
+              against its current locks — read-only: nothing is re-pinned,
+              committed, or pushed. Depth follows --check (eval by default,
+              full builds the checks); --with-partitions also checks
+              partition/dev input flakes
+  graph       Print the dependency DAG in topological order
+
+Step forms:
+  step                          run the next ready action; if it fails, try
+                                the remaining ready actions until one succeeds
+  step <repo>                   likewise, restricted to <repo>
+  step update-pins <repo>       re-pin <repo>'s stale local inputs and commit
+  step push <repo>              push <repo>
+  step bump-submodules          stage+commit stale submodule pointers (workspace)
+
+Options:
+  -n, --dry-run         Print state-changing commands instead of running them
+      --check=MODE      How to validate proposed pin states before locks are
+                        written, via `nix flake check --no-write-lock-file
+                        --override-input ...`: none (skip validation), eval
+                        (the default; adds --no-build, catching evaluation
+                        errors only), or full (also builds the flake's
+                        checks). The full stale set is tried first; if it
+                        fails, targets are tried cumulatively in dependency
+                        order, a failing target holds back only its own pins
+                        while the remaining targets are still tried, and
+                        whatever passes advances in one commit. The same
+                        mode picks the depth of the `check` command (none
+                        is rejected there)
+      --fetch           git fetch every repo before assessing state
+      --local           Touch working trees only: advance pins through the
+                        same check gate, but never commit, push, or bump
+                        submodule pointers. Runs with dirty trees and on
+                        detached HEADs — with no commits, nothing can
+                        strand — so it works in any checkout, including
+                        agent worktrees. Pins still advance only to pushed
+                        sibling revs, so the locks written are exactly the
+                        ones CI convergence will commit
+      --with-partitions Also manage partition/dev input flakes: every tracked
+                        flake.lock below a repo's root (e.g. tests/dependencies)
+                        joins staleness detection and update-pins
+      --with-tests      Also check always-unlocked test flakes (flake.nix with a
+                        gitignored lock): report stray untracked flake.lock
+                        files, which silently pin standalone runs to stale revs.
+                        Informational only; their inputs are wired in nix code
+                        from the partition inputs, so --with-partitions already
+                        keeps them current
+      --with-external   Also manage external (non-sibling) root-level inputs,
+                        e.g. nixpkgs or home-manager: an input is stale if
+                        `nix flake update <input>` would move its locked rev.
+                        Ready external pins advance with the same check gate
+                        and join the same update-pins commit as sibling pins
+      --all             Shorthand for --with-partitions --with-tests --with-external
+  -h, --help            Show this help
+
+The workspace is found from the current directory: the enclosing git repo,
+walked up to the parent-most repo that tracks it as a submodule. A repo
+that is nobody's submodule is its own workspace; a cwd outside any git
+repo is an error.
+
+Actions only run when safe: pins advance only to pushed revs (and, by
+default, only if the proposed pin state passes an evaluation-only nix flake
+check), and a pin that cannot advance holds back only itself, never its
+siblings. Pushes are skipped on detached HEADs or when behind upstream, and
+repos with uncommitted changes (other than flake.lock and submodule
+pointers) block their own automation. Blockers are reported for you to
+resolve.
+EOF
+}
+
+# ---------------------------------------------------------------- utilities
+
+DRY_RUN=false
+DO_FETCH=false
+LOCAL=false
+WITH_PARTITIONS=false
+WITH_TESTS=false
+WITH_EXTERNAL=false
+CHECK_MODE="eval" # none, eval, or full
+
+if [ -t 1 ]; then
+  C_RED=$'\033[31m' C_GRN=$'\033[32m' C_YLW=$'\033[33m' C_BLD=$'\033[1m' C_OFF=$'\033[0m'
+else
+  C_RED='' C_GRN='' C_YLW='' C_BLD='' C_OFF=''
+fi
+
+die() { echo "flake-sync: error: $*" >&2; exit 1; }
+
+run() {
+  echo "${C_BLD}+ $*${C_OFF}"
+  if ! $DRY_RUN; then "$@"; fi
+}
+
+# ------------------------------------------------------------- repo model
+#
+# Every repo (submodules + the workspace itself) is keyed by name.
+
+# The workspace root comes from the caller's cwd, not from this script's
+# own location: find the enclosing git repo, then walk up as long as the
+# current repo is registered as a submodule of an enclosing one, ending at
+# the parent-most superproject. A repo that is nobody's submodule is its
+# own root; a cwd outside any git repo is an error.
+find_root() {
+  local top super
+  top=$(git rev-parse --show-toplevel 2>/dev/null) \
+    || die "not inside a git repository (run from within a workspace checkout)"
+  while super=$(git -C "$top" rev-parse --show-superproject-working-tree 2>/dev/null) \
+    && [ -n "$super" ]; do
+    top=$super
+  done
+  printf '%s\n' "$top"
+}
+ROOT=$(find_root)
+[ -f "$ROOT/.gitmodules" ] || die "$ROOT has no .gitmodules"
+WS=  # set by discover_repos
+
+declare -A DIR=()        # repo -> absolute path
+declare -A SUBPATH=()    # repo -> path relative to $ROOT (submodules only)
+declare -A GH2REPO=()    # "owner/repo" -> repo name
+declare -A URL2REPO=()   # normalized non-github remote URL -> repo name
+declare -A PINBASE=()    # repo -> flake ref base ("github:o/r" or "git+file://...")
+declare -A BRANCH=()     # repo -> branch name or "(detached)"
+declare -A HEADREV=()    # repo -> HEAD rev
+declare -A AHEAD=()      # repo -> commits not on any remote
+declare -A BEHIND=()     # repo -> commits behind upstream (0 if no upstream)
+declare -A HAS_UPSTREAM=()
+declare -A DIRTY=()      # repo -> blocking-dirty description ("" if clean)
+declare -A LOCK_DIRTY=() # repo -> "yes" if flake.lock has uncommitted changes
+declare -A PINS=()       # repo -> lines "input<TAB>target-repo<TAB>locked-rev<TAB>flakedir"
+declare -A EXTPINS=()    # repo -> lines "input<TAB>locked-rev<TAB>flakedir" (non-sibling root inputs)
+declare -A EXTSTALE=()   # "repo<TAB>input<TAB>flakedir" -> "stale" or "ok" (populated with --with-external)
+declare -A EXTURL=()     # same key -> exact-rev override ref for a stale external pin (resolved by its trial lock)
+declare -A DEPS=()       # repo -> space-separated dep repo names
+declare -A STALE_PTR=()  # workspace only: lines "repo<TAB>recorded-rev"
+TOPO=()
+
+gh_slug() { # normalize a github remote URL to owner/repo, empty otherwise
+  local url=$1
+  case $url in
+    git@github.com:*) url=${url#git@github.com:} ;;
+    https://github.com/*) url=${url#https://github.com/} ;;
+    ssh://git@github.com/*) url=${url#ssh://git@github.com/} ;;
+    *) return 0 ;;
+  esac
+  url=${url%/}; url=${url%.git}
+  case $url in
+    */*/*) ;;
+    ?*/?*) echo "$url" ;;
+  esac
+}
+
+norm_url() { # canonicalize a git/file remote URL for matching
+  local url=$1
+  url=${url#git+}
+  case $url in /*) url="file://$url" ;; esac
+  url=${url%/}; url=${url%.git}
+  echo "$url"
+}
+
+discover_repos() {
+  # Name the workspace after its origin repo when possible; a worktree's
+  # directory basename would be misleading.
+  local ws_slug
+  ws_slug=$(gh_slug "$(git -C "$ROOT" remote get-url origin 2>/dev/null || true)")
+  WS=${ws_slug##*/}
+  [ -n "$WS" ] || WS=$(basename "$ROOT")
+  DIR[$WS]=$ROOT
+  local key path url name
+  while read -r key path; do
+    name=$(basename "$path")
+    [ -f "$ROOT/$path/flake.nix" ] || continue
+    [ -e "$ROOT/$path/.git" ] || { echo "${C_YLW}warning: submodule $path not initialized; skipping${C_OFF}" >&2; continue; }
+    [ "$name" != "$WS" ] || die "submodule name collides with workspace name '$WS'"
+    DIR[$name]=$ROOT/$path
+    SUBPATH[$name]=$path
+    url=$(git config -f "$ROOT/.gitmodules" "${key%.path}.url")
+    local slug; slug=$(gh_slug "$url")
+    if [ -n "$slug" ]; then
+      GH2REPO[$slug]=$name
+      PINBASE[$name]="github:$slug"
+    else
+      URL2REPO[$(norm_url "$url")]=$name
+      case $url in
+        git+*) PINBASE[$name]=$url ;;
+        /*) PINBASE[$name]="git+file://$url" ;;
+        *) PINBASE[$name]="git+$url" ;;
+      esac
+    fi
+  done < <(git config -f "$ROOT/.gitmodules" --get-regexp '^submodule\..*\.path$')
+  return 0
+}
+
+read_git_state() {
+  local repo=$1 dir=${DIR[$1]}
+  HEADREV[$repo]=$(git -C "$dir" rev-parse HEAD)
+  BRANCH[$repo]=$(git -C "$dir" symbolic-ref --quiet --short HEAD || echo "(detached)")
+  AHEAD[$repo]=$(git -C "$dir" rev-list --count HEAD --not --remotes)
+  if git -C "$dir" rev-parse --quiet --verify '@{u}' >/dev/null 2>&1; then
+    HAS_UPSTREAM[$repo]=yes
+    BEHIND[$repo]=$(git -C "$dir" rev-list --count 'HEAD..@{u}')
+  else
+    # No @{u} on a detached HEAD (the normal post-`submodule update` state):
+    # fall back to the remote's default branch so staleness is still
+    # detected instead of silently reading as 0.
+    HAS_UPSTREAM[$repo]=no
+    local default_ref
+    default_ref=$(git -C "$dir" symbolic-ref --quiet --short refs/remotes/origin/HEAD 2>/dev/null || echo "")
+    if [ -n "$default_ref" ]; then
+      BEHIND[$repo]=$(git -C "$dir" rev-list --count "HEAD..$default_ref")
+    else
+      BEHIND[$repo]=0
+    fi
+  fi
+
+  # Blocking dirt: tracked changes other than flake.lock; for the workspace,
+  # submodule pointer changes are handled separately, not as dirt.
+  local ignore=() line dirty=0 lockdirty=no
+  [ "$repo" = "$WS" ] && ignore=(--ignore-submodules=all)
+  while IFS= read -r line; do
+    case ${line:0:2} in '??') continue ;; esac
+    case ${line:3} in
+      flake.lock | */flake.lock) lockdirty=yes ;;
+      *) dirty=$((dirty + 1)) ;;
+    esac
+  done < <(git -C "$dir" status --porcelain "${ignore[@]}")
+  DIRTY[$repo]=$([ "$dirty" -gt 0 ] && echo "$dirty uncommitted change(s)" || echo "")
+  LOCK_DIRTY[$repo]=$lockdirty
+}
+
+read_lock_pins() { # append sibling-repo (and, with --with-external, external) pins from one lock; $3 = flake dir rel to repo ("." = root)
+  local repo=$1 lock=$2 fd=$3
+  [ -f "$lock" ] || return 0
+  local input kind key rev target
+  while IFS=$'\t' read -r input kind key rev; do
+    case $kind in
+      gh) target=${GH2REPO[$key]:-} ;;
+      git) target=${URL2REPO[$(norm_url "$key")]:-} ;;
+      *) target="" ;;
+    esac
+    if [ -n "$target" ] && [ "$target" != "$repo" ]; then
+      PINS[$repo]+="$input	$target	$rev	$fd"$'\n'
+      case " ${DEPS[$repo]} " in *" $target "*) ;; *) DEPS[$repo]+="$target " ;; esac
+    elif [ -z "$target" ] && $WITH_EXTERNAL; then
+      EXTPINS[$repo]+="$input	$rev	$fd"$'\n'
+    fi
+  done < <(jq -r '
+    . as $L | ($L.nodes[$L.root].inputs // {}) | to_entries[]
+    | select(.value | type == "string")
+    | . as $e | $L.nodes[$e.value].locked // {}
+    | if .type == "github" then "\($e.key)\tgh\t\(.owner)/\(.repo)\t\(.rev)"
+      elif .type == "git" then "\($e.key)\tgit\t\(.url)\t\(.rev)"
+      else empty end' "$lock")
+  return 0
+}
+
+read_pins() { # sibling-repo (+ external, with --with-external) pins from the root lock (+ partition locks with --with-partitions)
+  local repo=$1 dir=${DIR[$1]}
+  PINS[$repo]='' DEPS[$repo]='' EXTPINS[$repo]=''
+  read_lock_pins "$repo" "$dir/flake.lock" "."
+  if $WITH_PARTITIONS; then
+    local sub fd
+    while IFS= read -r sub; do
+      fd=$(dirname "$sub")
+      [ -f "$dir/$fd/flake.nix" ] || continue
+      read_lock_pins "$repo" "$dir/$sub" "$fd"
+    done < <(git -C "$dir" ls-files -- '*/flake.lock')
+  fi
+  return 0
+}
+
+EXTTMP=
+ext_tmpdir() { # lazily create, and register cleanup for, a scratch dir for trial lock files
+  if [ -z "$EXTTMP" ]; then
+    EXTTMP=$(mktemp -d) || die "cannot create scratch dir for external-pin trials"
+    trap 'rm -rf "$EXTTMP"' EXIT
+  fi
+  echo "$EXTTMP"
+}
+
+read_ext_staleness() { # populate EXTSTALE/EXTURL for repo $1's external pins: does `nix flake update <input>` move the lock, and to what?
+  local repo=$1 dir=${DIR[$1]} input rev fd flakedir trial new_rev new_url
+  while IFS=$'\t' read -r input rev fd; do
+    [ -n "$input" ] || continue
+    flakedir=$dir; [ "$fd" = "." ] || flakedir=$dir/$fd
+    trial=$(ext_tmpdir)/$repo-$fd-$input.lock
+    mkdir -p "$(dirname "$trial")"
+    new_rev="" new_url=""
+    if nix flake update "$input" --flake "$flakedir" --output-lock-file "$trial" \
+        >/dev/null 2>&1; then
+      # The trial lock's resolved rev doubles as the advance target: the
+      # override ref built here is what update-pins locks to, so the gate
+      # checks and the lock writes one and the same rev.
+      IFS=$'\t' read -r new_rev new_url < <(jq -r --arg i "$input" '
+        .nodes[.nodes[.root].inputs[$i]].locked // {}
+        | if .type == "github" then "\(.rev)\tgithub:\(.owner)/\(.repo)/\(.rev)"
+          elif .type == "git" then "\(.rev)\tgit+\(.url)?rev=\(.rev)\(if .ref then "&ref=\(.ref)" else "" end)"
+          else empty end' "$trial") || true
+    fi
+    if [ -n "$new_rev" ] && [ "$new_rev" != "$rev" ]; then
+      EXTSTALE["$repo	$input	$fd"]=stale
+      EXTURL["$repo	$input	$fd"]=$new_url
+    else
+      EXTSTALE["$repo	$input	$fd"]=ok
+    fi
+  done <<<"${EXTPINS[$repo]:-}"
+  return 0
+}
+
+read_pointer_state() { # workspace submodule pointers vs submodule HEADs
+  STALE_PTR[$WS]=''
+  local repo recorded
+  for repo in "${!SUBPATH[@]}"; do
+    recorded=$(git -C "$ROOT" ls-tree HEAD -- "${SUBPATH[$repo]}" | awk '{print $3}')
+    if [ -n "$recorded" ] && [ "$recorded" != "${HEADREV[$repo]}" ]; then
+      STALE_PTR[$WS]+="$repo	$recorded"$'\n'
+    fi
+  done
+}
+
+is_pushed() { # is $2 (default HEAD) of repo $1 reachable from some remote ref?
+  local rev=${2:-${HEADREV[$1]}}
+  [ "$(git -C "${DIR[$1]}" rev-list --count "$rev" --not --remotes)" = 0 ]
+}
+
+toposort() {
+  # Kahn's algorithm over DEPS; workspace additionally depends on every
+  # submodule (pointer bumps must come last).
+  local -A remaining=()
+  local repo dep progressed
+  for repo in "${!DIR[@]}"; do
+    local deps="${DEPS[$repo]:-}"
+    [ "$repo" = "$WS" ] && for dep in "${!SUBPATH[@]}"; do deps+="$dep "; done
+    remaining[$repo]=$deps
+  done
+  TOPO=()
+  while [ ${#remaining[@]} -gt 0 ]; do
+    progressed=no
+    for repo in $(printf '%s\n' "${!remaining[@]}" | sort); do
+      local unmet=no
+      for dep in ${remaining[$repo]}; do
+        [ -n "${remaining[$dep]+x}" ] && { unmet=yes; break; }
+      done
+      if [ "$unmet" = no ]; then
+        TOPO+=("$repo"); unset "remaining[$repo]"; progressed=yes
+      fi
+    done
+    [ "$progressed" = yes ] || die "dependency cycle among: ${!remaining[*]}$($WITH_PARTITIONS && echo " (partition/dev pins can create cycles that have no convergent fixpoint; break the cycle or drop --with-partitions)")"
+  done
+}
+
+refresh_state() { # re-read git/pin state for every repo (after a mutating action, or for the initial load)
+  local repo
+  for repo in "${!DIR[@]}"; do
+    read_git_state "$repo"
+    read_pins "$repo"
+  done
+  if $WITH_EXTERNAL; then
+    for repo in "${!DIR[@]}"; do read_ext_staleness "$repo"; done
+  fi
+  read_pointer_state
+}
+
+load_state() {
+  discover_repos
+  local repo
+  if $DO_FETCH; then
+    for repo in "${!DIR[@]}"; do
+      echo "fetching $repo..." >&2
+      git -C "${DIR[$repo]}" fetch --quiet || echo "${C_YLW}warning: fetch failed for $repo${C_OFF}" >&2
+    done
+  fi
+  refresh_state
+  toposort
+}
+
+# ------------------------------------------------------------------- plan
+#
+# PLAN holds lines: "READY|action|repo|detail" or "BLOCKED|action|repo|reason",
+# in execution order (topological, pins before pushes).
+
+PLAN=()
+
+stale_pin_inputs() { # ready-to-advance stale pins of $1: "input<TAB>target<TAB>flakedir"
+  local repo=$1 input target rev fd
+  while IFS=$'\t' read -r input target rev fd; do
+    [ -n "$input" ] || continue
+    [ "$rev" = "${HEADREV[$target]}" ] && continue
+    is_pushed "$target" && echo "$input	$target	$fd"
+  done <<<"${PINS[$repo]:-}"
+  return 0
+}
+
+blocked_pin_targets() { # stale inputs of $1 whose target rev is unpushed
+  local repo=$1 input target rev fd
+  while IFS=$'\t' read -r input target rev fd; do
+    [ -n "$input" ] || continue
+    [ "$rev" = "${HEADREV[$target]}" ] && continue
+    is_pushed "$target" || echo "$target"
+  done <<<"${PINS[$repo]:-}" | sort -u
+}
+
+stale_ext_inputs() { # stale external pins of $1 (--with-external only): "input<TAB>flakedir<TAB>override-ref"
+  $WITH_EXTERNAL || return 0
+  local repo=$1 input rev fd
+  while IFS=$'\t' read -r input rev fd; do
+    [ -n "$input" ] || continue
+    [ "${EXTSTALE["$repo	$input	$fd"]:-ok}" = stale ] && echo "$input	$fd	${EXTURL["$repo	$input	$fd"]}"
+  done <<<"${EXTPINS[$repo]:-}"
+  return 0
+}
+
+pin_label() { # "input" for the root lock, "dir:input" for partition locks
+  [ "$2" = "." ] && echo "$1" || echo "$2:$1"
+}
+
+stray_test_locks() { # untracked flake.lock files next to a tracked flake.nix in $1
+  local repo=$1 dir=${DIR[$1]} f d
+  while IFS= read -r f; do
+    d=$(dirname "$f")
+    git -C "$dir" ls-files --error-unmatch "$d/flake.lock" >/dev/null 2>&1 && continue
+    [ -f "$dir/$d/flake.lock" ] && echo "$d/flake.lock"
+  done < <(git -C "$dir" ls-files -- '*/flake.nix')
+  return 0
+}
+
+build_plan() {
+  PLAN=()
+  local repo
+  for repo in "${TOPO[@]}"; do
+    local ready blocked extready
+    ready=$(stale_pin_inputs "$repo")
+    blocked=$(blocked_pin_targets "$repo")
+    extready=$(stale_ext_inputs "$repo")
+    if [ -n "$ready" ] || [ -n "$blocked" ] || [ -n "$extready" ]; then
+      local names extnames blockednames
+      names=$(awk -F'\t' 'NF { print ($3 == "." ? $1 : $3 ":" $1) }' <<<"$ready" | paste -sd, -)
+      extnames=$(awk -F'\t' 'NF { print ($2 == "." ? $1 : $2 ":" $1) }' <<<"$extready" | paste -sd, -)
+      [ -n "$extnames" ] && names=${names:+$names,}$extnames
+      blockednames=$(paste -sd, - <<<"$blocked")
+      # A pin that cannot advance (unpushed target, failing check) holds back
+      # only itself: sibling pins still advance, with nix flake check
+      # arbitrating which partial states are publishable. Dirty trees and
+      # detached HEADs only endanger commits, so --local ignores them.
+      if ! $LOCAL && [ -n "${DIRTY[$repo]}" ]; then
+        PLAN+=("BLOCKED|update-pins|$repo|stale pins (${names:-$blockednames}) but repo has ${DIRTY[$repo]}")
+      elif ! $LOCAL && [ "${BRANCH[$repo]}" = "(detached)" ]; then
+        PLAN+=("BLOCKED|update-pins|$repo|stale pins (${names:-$blockednames}) but HEAD is detached; check out a branch")
+      elif [ -n "$ready" ] || [ -n "$extready" ]; then
+        local detail="advance pins: $names"
+        [ -n "$blocked" ] && detail+=" (holding pins to unpushed: $blockednames)"
+        PLAN+=("READY|update-pins|$repo|$detail")
+      else
+        PLAN+=("BLOCKED|update-pins|$repo|stale pin(s) to unpushed target(s): $blockednames")
+      fi
+    fi
+
+    if $WITH_TESTS; then
+      local strays
+      strays=$(stray_test_locks "$repo")
+      [ -n "$strays" ] && PLAN+=("WARN|test-locks|$repo|stray untracked lock(s): $(paste -sd, - <<<"$strays") — unlocked test flakes get their inputs via nix wiring, so a stray lock silently pins standalone runs; delete it (or track it to manage it)")
+    fi
+
+    # Everything below plans commits and pushes — publication, which --local
+    # leaves entirely to CI convergence (or a full local converge).
+    $LOCAL && continue
+
+    if [ "$repo" = "$WS" ] && [ -n "${STALE_PTR[$WS]}" ]; then
+      local bumpable=() waiting=() sub
+      while IFS=$'\t' read -r sub _; do
+        [ -n "$sub" ] || continue
+        if is_pushed "$sub"; then bumpable+=("$sub"); else waiting+=("$sub"); fi
+      done <<<"${STALE_PTR[$WS]}"
+      [ ${#bumpable[@]} -gt 0 ] && PLAN+=("READY|bump-submodules|$WS|record new pointer(s): ${bumpable[*]}")
+      [ ${#waiting[@]} -gt 0 ] && PLAN+=("BLOCKED|bump-submodules|$WS|pointer(s) stale but unpushed: ${waiting[*]}")
+    fi
+
+    if [ "${AHEAD[$repo]}" -gt 0 ]; then
+      if [ "${BRANCH[$repo]}" = "(detached)" ]; then
+        PLAN+=("BLOCKED|push|$repo|${AHEAD[$repo]} unpushed commit(s) on detached HEAD")
+      elif [ "${BEHIND[$repo]}" -gt 0 ]; then
+        PLAN+=("BLOCKED|push|$repo|behind upstream by ${BEHIND[$repo]}; pull/rebase first")
+      else
+        PLAN+=("READY|push|$repo|push ${AHEAD[$repo]} commit(s) on ${BRANCH[$repo]}")
+      fi
+    elif [ "${BEHIND[$repo]}" -gt 0 ]; then
+      # Nothing to push, so the branch above never fires — without this,
+      # a local checkout can drift arbitrarily far behind its own remote
+      # (e.g. left on detached HEAD after `submodule update`) with no
+      # actionable signal, only a color in `status`'s git column.
+      if [ "${BRANCH[$repo]}" = "(detached)" ]; then
+        PLAN+=("BLOCKED|pull|$repo|detached HEAD is behind upstream by ${BEHIND[$repo]}; run 'flake-sync pull'")
+      else
+        PLAN+=("BLOCKED|pull|$repo|behind upstream by ${BEHIND[$repo]}; run 'flake-sync pull'")
+      fi
+    fi
+
+    [ -n "${DIRTY[$repo]}" ] && PLAN+=("BLOCKED|commit|$repo|${DIRTY[$repo]} need manual commit")
+  done
+  return 0
+}
+
+# ---------------------------------------------------------------- actions
+
+report_held() { # after a partial advance of $1: fail loudly about held-back pins ($2)
+  [ -n "$2" ] || return 0
+  die "$1 advanced what it could; held back — $2"
+}
+
+pin_override_args() { # print --override-input args (one per line) for pins of flake dir $2 in $1 whose target is in $3
+  local lines=$1 fd=$2 targets=" $3 " input target f2 base ref
+  while IFS=$'\t' read -r input target f2; do
+    [ "$f2" = "$fd" ] || continue
+    case $targets in *" $target "*) ;; *) continue ;; esac
+    base=${PINBASE[$target]:-}
+    [ -n "$base" ] || die "no pin base URL known for $target"
+    case $base in
+      github:*) ref="$base/${HEADREV[$target]}" ;;
+      *)
+        ref="$base?rev=${HEADREV[$target]}"
+        [ "${BRANCH[$target]}" != "(detached)" ] && ref+="&ref=refs/heads/${BRANCH[$target]}"
+        ;;
+    esac
+    printf '%s\n' --override-input "$input" "$ref"
+  done <<<"$lines"
+  return 0
+}
+
+ext_override_args() { # print --override-input args (one per line) for stale external pins of flake dir $2 in extlines $1
+  local extlines=$1 fd=$2 input f2 ref
+  while IFS=$'\t' read -r input f2 ref; do
+    [ -n "$input" ] || continue
+    [ "$f2" = "$fd" ] || continue
+    printf '%s\n' --override-input "$input" "$ref"
+  done <<<"$extlines"
+  return 0
+}
+
+trial_args() { # print override args for flake dir $3, given trial target set $2 and sibling pin lines $1; extlines $4
+  local lines=$1 trial=$2 fd=$3 extlines=$4
+  case " $trial " in *" $EXT_PSEUDO_TARGET "*) ext_override_args "$extlines" "$fd" ;; esac
+  pin_override_args "$lines" "$fd" "$trial"
+}
+
+# Pseudo-target standing in for "all stale external pins" in the step-wise
+# trial loop: external pins have no sibling HEAD to pin to and no unpushed-
+# target concept, so they cannot be tried one-by-one in dependency order like
+# sibling targets. They are tried first, as one unit, so a failure holds back
+# only external pins and sibling targets still get their own trials on a
+# clean base.
+EXT_PSEUDO_TARGET='__external__'
+
+do_update_pins() {
+  local repo=$1 dir=${DIR[$1]}
+  if ! $LOCAL; then
+    [ -z "${DIRTY[$repo]}" ] || die "$repo has ${DIRTY[$repo]}; commit or stash first"
+    [ "${BRANCH[$repo]}" != "(detached)" ] || die "$repo is on a detached HEAD; check out a branch first"
+  fi
+  local held_unpushed
+  held_unpushed=$(blocked_pin_targets "$repo" | paste -sd' ' -)
+  local lines; lines=$(stale_pin_inputs "$repo")
+  local extlines; extlines=$(stale_ext_inputs "$repo")
+  [ -n "$lines" ] || [ -n "$extlines" ] \
+    || die "no ready-to-advance stale pins in $repo${held_unpushed:+ (holding pin(s) to unpushed target(s): $held_unpushed)}"
+  local fds=() input target fd
+  while IFS=$'\t' read -r input target fd; do
+    case " ${fds[*]-} " in *" $fd "*) ;; *) fds+=("$fd") ;; esac
+  done <<<"$lines"
+  while IFS=$'\t' read -r input fd _; do
+    [ -n "$input" ] || continue
+    case " ${fds[*]-} " in *" $fd "*) ;; *) fds+=("$fd") ;; esac
+  done <<<"$extlines"
+  # Step-wise checking: try the stale pin targets cumulatively in dependency
+  # order, greedily growing the advancing set. A target whose trial state
+  # fails `nix flake check` is held back alone — the order is only a
+  # linearization of the DAG, so an unrelated failure must not stop later
+  # targets, and even a dependent of a held target may still advance (its
+  # HEAD can be ahead of our pin regardless). The check arbitrates which
+  # partial states are publishable. We advance a pin to its target's HEAD or
+  # not at all: the goal is fewer stale pins, not smaller staleness.
+  #
+  # External pins have no sibling HEAD and no unpushed-target concept, so
+  # they're tried first as a single pseudo-target ($EXT_PSEUDO_TARGET): a
+  # failure holds back only external pins and sibling targets still get
+  # their own trials on a clean base.
+  local stale_targets=() t
+  [ -n "$extlines" ] && stale_targets+=("$EXT_PSEUDO_TARGET")
+  for t in "${TOPO[@]}"; do
+    cut -f2 <<<"$lines" | grep -Fqx "$t" && stale_targets+=("$t")
+  done
+  local advance=() held_check=() args=() flakedir
+  if [ "$CHECK_MODE" = none ]; then
+    advance=("${stale_targets[@]}")
+  else
+    local check_flags=(--no-write-lock-file)
+    [ "$CHECK_MODE" = eval ] && check_flags+=(--no-build)
+    # check_trial: gate the trial target set $* through nix flake check for
+    # every flake dir with stale pins. Runs in do_update_pins's scope (uses
+    # its dir, fds, lines, extlines, check_flags via dynamic scoping).
+    check_trial() {
+      local trial=$* fd flakedir args=()
+      for fd in "${fds[@]}"; do
+        flakedir=$dir; [ "$fd" = "." ] || flakedir=$dir/$fd
+        mapfile -t args < <(trial_args "$lines" "$trial" "$fd" "$extlines")
+        [ ${#args[@]} -gt 0 ] || continue
+        run nix flake check "$flakedir" "${check_flags[@]}" "${args[@]}" || return 1
+      done
+      return 0
+    }
+    # The full stale set is tried first. When everything is publishable
+    # that is one check instead of N, and it is the only trial that can
+    # pass pins that must move jointly: sibling repos each lock shared
+    # deps (ch-flake et al), so advancing only some of them puts two revs
+    # of the shared dep in one closure, which consumers that import its
+    # flakeModule reject ("option ... is already declared"). In that case
+    # every per-target trial fails individually while the union passes.
+    if [ ${#stale_targets[@]} -gt 1 ] && check_trial "${stale_targets[@]}"; then
+      advance=("${stale_targets[@]}")
+    else
+      [ ${#stale_targets[@]} -gt 1 ] \
+        && echo "${C_YLW}full pin set fails nix flake check; trying targets step-wise${C_OFF}"
+      for t in "${stale_targets[@]}"; do
+        if check_trial ${advance[@]+"${advance[@]}"} "$t"; then
+          advance=(${advance[@]+"${advance[@]}"} "$t")
+        else
+          held_check+=("$t")
+          local tlabel=$t; [ "$t" = "$EXT_PSEUDO_TARGET" ] && tlabel="external pins"
+          echo "${C_YLW}holding $tlabel (fails nix flake check); trying the remaining targets${C_OFF}"
+        fi
+      done
+    fi
+  fi
+  local held_report="" hc
+  if [ ${#held_check[@]} -gt 0 ]; then
+    local held_labels=()
+    for hc in "${held_check[@]}"; do
+      [ "$hc" = "$EXT_PSEUDO_TARGET" ] && held_labels+=("external pins") || held_labels+=("$hc")
+    done
+    held_report="fail nix flake check ($CHECK_MODE): ${held_labels[*]}"
+  fi
+  [ -n "$held_unpushed" ] && held_report+="${held_report:+; }target unpushed: $held_unpushed"
+  [ ${#advance[@]} -gt 0 ] || die "no pins advanced in $repo; held back — $held_report"
+  local names=()
+  while IFS=$'\t' read -r input t fd; do
+    [ -n "$input" ] || continue
+    case " ${advance[*]} " in *" $t "*) names+=("$(pin_label "$input" "$fd")") ;; esac
+  done <<<"$lines"
+  case " ${advance[*]} " in
+    *" $EXT_PSEUDO_TARGET "*)
+      while IFS=$'\t' read -r input fd _; do
+        [ -n "$input" ] || continue
+        names+=("$(pin_label "$input" "$fd")")
+      done <<<"$extlines"
+      ;;
+  esac
+  local paths=()
+  for fd in "${fds[@]}"; do
+    mapfile -t args < <(trial_args "$lines" "${advance[*]}" "$fd" "$extlines")
+    [ ${#args[@]} -gt 0 ] || continue
+    local lockpath=flake.lock
+    flakedir=$dir
+    if [ "$fd" != "." ]; then flakedir=$dir/$fd lockpath=$fd/flake.lock; fi
+    run nix flake lock "$flakedir" "${args[@]}"
+    paths+=("$lockpath")
+  done
+  if ! $DRY_RUN; then
+    if git -C "$dir" diff --quiet -- "${paths[@]}" && git -C "$dir" diff --cached --quiet -- "${paths[@]}"; then
+      echo "flake.lock unchanged in $repo; nothing to $($LOCAL && echo write || echo commit)"
+      report_held "$repo" "$held_report"
+      return 0
+    fi
+  fi
+  if $LOCAL; then
+    echo "${C_GRN}updated pins in $repo (working tree; not committed): ${names[*]}${C_OFF}"
+    report_held "$repo" "$held_report"
+    return 0
+  fi
+  local msg
+  msg="maint: update flake pins ($(IFS=,; echo "${names[*]}"))"
+  run git -C "$dir" commit --quiet -m "$msg" -- "${paths[@]}"
+  echo "${C_GRN}updated pins in $repo: ${names[*]}${C_OFF}"
+  report_held "$repo" "$held_report"
+}
+
+do_push() {
+  local repo=$1 dir=${DIR[$1]}
+  ! $LOCAL || die "push is publication; --local touches working trees only"
+  [ "${BRANCH[$repo]}" != "(detached)" ] || die "$repo is on a detached HEAD"
+  [ "${BEHIND[$repo]}" = 0 ] || die "$repo is behind upstream; pull/rebase first"
+  local args=()
+  [ "${HAS_UPSTREAM[$repo]}" = yes ] || args=(-u origin "${BRANCH[$repo]}")
+  if ! run git -C "$dir" push --quiet "${args[@]}"; then
+    # Most likely the remote moved while we worked (another checkout or
+    # session pushed). Refresh our remote-tracking refs so status/plan report
+    # "behind upstream" truthfully, then leave the rebase to the user.
+    git -C "$dir" fetch --quiet || true
+    local behind
+    behind=$(git -C "$dir" rev-list --count 'HEAD..@{u}' 2>/dev/null || echo "?")
+    die "push of $repo was rejected: the remote branch moved while we worked (now behind by $behind commit(s)). Rebase it yourself — e.g. git -C ${dir#"$ROOT"/} pull --rebase — then rerun."
+  fi
+  echo "${C_GRN}pushed $repo (${BRANCH[$repo]})${C_OFF}"
+}
+
+do_bump_submodules() {
+  ! $LOCAL || die "bump-submodules is publication; --local touches working trees only"
+  local paths=() names=() sub
+  while IFS=$'\t' read -r sub _; do
+    [ -n "$sub" ] || continue
+    is_pushed "$sub" || continue
+    paths+=("${SUBPATH[$sub]}"); names+=("$sub")
+  done <<<"${STALE_PTR[$WS]:-}"
+  [ ${#paths[@]} -gt 0 ] || die "no pushed submodule pointers to bump"
+  local msg
+  msg="maint: bump $(IFS=,; echo "${names[*]}")"
+  run git -C "$ROOT" commit --quiet -m "$msg" -- "${paths[@]}"
+  echo "${C_GRN}recorded submodule pointer(s): ${names[*]}${C_OFF}"
+}
+
+run_action() {
+  local action=$1 repo=$2
+  case $action in
+    update-pins) do_update_pins "$repo" ;;
+    push) do_push "$repo" ;;
+    bump-submodules) do_bump_submodules ;;
+    *) die "unknown action '$action'" ;;
+  esac
+}
+
+# --------------------------------------------------------------- commands
+
+pin_summary() { # one-line pin status for a repo
+  local repo=$1 parts=() input target rev fd label
+  while IFS=$'\t' read -r input target rev fd; do
+    [ -n "$input" ] || continue
+    label=$(pin_label "$input" "$fd")
+    if [ "$rev" = "${HEADREV[$target]}" ]; then
+      parts+=("${C_GRN}$label=ok${C_OFF}")
+    else
+      parts+=("${C_YLW}$label=stale${C_OFF}")
+    fi
+  done <<<"${PINS[$repo]:-}"
+  if $WITH_EXTERNAL; then
+    while IFS=$'\t' read -r input rev fd; do
+      [ -n "$input" ] || continue
+      label="ext:$(pin_label "$input" "$fd")"
+      if [ "${EXTSTALE["$repo	$input	$fd"]:-ok}" = stale ]; then
+        parts+=("${C_YLW}$label=stale${C_OFF}")
+      else
+        parts+=("${C_GRN}$label=ok${C_OFF}")
+      fi
+    done <<<"${EXTPINS[$repo]:-}"
+  fi
+  [ ${#parts[@]} -gt 0 ] && (IFS=' '; echo "${parts[*]}") || echo "-"
+}
+
+pad() { # print $2 left-justified to visible width $1 (ignoring ANSI codes)
+  local plain
+  plain=$(sed -E $'s/\033\\[[0-9;]*m//g' <<<"$2")
+  printf '%s%*s' "$2" $(($1 > ${#plain} ? $1 - ${#plain} : 1)) ""
+}
+
+cmd_status() {
+  local repo git pins
+  printf "${C_BLD}%-22s %-22s %-24s %s${C_OFF}\n" REPO BRANCH GIT "LOCAL PINS"
+  for repo in "${TOPO[@]}"; do
+    git=""
+    [ -n "${DIRTY[$repo]}" ] && git+="${C_RED}dirty${C_OFF} "
+    [ "${LOCK_DIRTY[$repo]}" = yes ] && git+="${C_YLW}lock-dirty${C_OFF} "
+    if [ "${AHEAD[$repo]}" -gt 0 ]; then git+="${C_YLW}ahead ${AHEAD[$repo]}${C_OFF} "; fi
+    if [ "${BEHIND[$repo]}" -gt 0 ]; then git+="${C_RED}behind ${BEHIND[$repo]}${C_OFF} "; fi
+    [ -n "$git" ] || git="${C_GRN}clean+pushed${C_OFF}"
+    pins=$(pin_summary "$repo")
+    if [ "$repo" = "$WS" ] && [ -n "${STALE_PTR[$WS]}" ]; then
+      pins+=" ${C_YLW}[stale pointers: $(cut -f1 <<<"${STALE_PTR[$WS]}" | sed '/^$/d' | paste -sd, -)]${C_OFF}"
+    fi
+    printf "%-22s %-22s " "$repo" "${BRANCH[$repo]}"
+    pad 24 "${git% }"
+    echo " $pins"
+  done
+
+  build_plan
+  echo
+  local entry state action target detail work=0 notes=()
+  for entry in "${PLAN[@]}"; do
+    IFS='|' read -r state _ _ _ <<<"$entry"
+    [ "$state" = WARN ] || work=$((work + 1))
+  done
+  if [ "$work" -eq 0 ]; then
+    if $LOCAL; then
+      echo "${C_GRN}Locally converged: working-tree pins are at the pushed sibling tips.${C_OFF}"
+    else
+      echo "${C_GRN}Converged: everything is committed, pushed, and pinned.${C_OFF}"
+    fi
+  else
+    echo "${C_BLD}Pending:${C_OFF}"
+  fi
+  for entry in "${PLAN[@]}"; do
+    IFS='|' read -r state action target detail <<<"$entry"
+    case $state in
+      READY) echo "  ${C_GRN}ready${C_OFF}    $action $target — $detail" ;;
+      WARN) notes+=("  ${C_YLW}note${C_OFF}     $action $target — $detail") ;;
+      *) echo "  ${C_RED}blocked${C_OFF}  $action $target — $detail" ;;
+    esac
+  done
+  local n
+  for n in ${notes[@]+"${notes[@]}"}; do echo "$n"; done
+}
+
+declare -A SKIP=() # "action|repo" entries converge gave up on this run
+
+first_ready() { # optionally filtered by repo ($1)
+  local entry state action target detail
+  for entry in "${PLAN[@]}"; do
+    IFS='|' read -r state action target detail <<<"$entry"
+    [ "$state" = READY ] || continue
+    [ -z "${1:-}" ] || [ "$target" = "$1" ] || continue
+    [ -z "${SKIP["$action|$target"]:-}" ] || continue
+    echo "$action|$target|$detail"
+    return 0
+  done
+  return 1
+}
+
+cmd_next() {
+  build_plan
+  local next entry state action target detail work=0
+  for entry in ${PLAN[@]+"${PLAN[@]}"}; do
+    IFS='|' read -r state _ _ _ <<<"$entry"
+    [ "$state" = WARN ] || work=$((work + 1))
+  done
+  if next=$(first_ready); then
+    IFS='|' read -r action target detail <<<"$next"
+    echo "next: $action $target — $detail"
+  elif [ "$work" -eq 0 ]; then
+    echo "${C_GRN}Converged: nothing to do.${C_OFF}"
+  else
+    echo "No ready actions; blocked:"
+    for entry in "${PLAN[@]}"; do
+      IFS='|' read -r state action target detail <<<"$entry"
+      [ "$state" = WARN ] && continue
+      echo "  $action $target — $detail"
+    done
+    return 1
+  fi
+}
+
+cmd_step() {
+  build_plan
+  local action="" target=""
+  case $# in
+    0) ;;
+    1)
+      if [ "$1" = bump-submodules ]; then action=$1 target=$WS
+      elif [ -n "${DIR[$1]:-}" ]; then target=$1
+      else die "'$1' is neither a repo nor 'bump-submodules'"
+      fi ;;
+    2) action=$1 target=$2; [ -n "${DIR[$target]:-}" ] || die "unknown repo '$target'" ;;
+    *) usage >&2; exit 2 ;;
+  esac
+  if [ -n "$action" ]; then
+    run_action "$action" "$target"
+    return
+  fi
+  # Auto mode: run the first ready action, but a failure must not wedge the
+  # caller (e.g. a CI loop invoking `step` per iteration) — skip it and try
+  # the remaining ready actions until one succeeds. Exit 0 iff a state
+  # change was made.
+  local next tgt failed=() attempts=0 repo
+  while next=$(first_ready "$target"); do
+    IFS='|' read -r action tgt _ <<<"$next"
+    if (run_action "$action" "$tgt"); then
+      return 0
+    fi
+    SKIP["$action|$tgt"]=1
+    failed+=("$action $tgt")
+    echo "${C_YLW}$action $tgt failed; trying the next ready action${C_OFF}"
+    attempts=$((attempts + 1))
+    [ $attempts -lt 100 ] || die "too many failed attempts; giving up"
+    # a failed action may still have changed state (e.g. a partial pin
+    # advance), so re-read before replanning
+    refresh_state
+    build_plan
+  done
+  if [ ${#failed[@]} -gt 0 ]; then
+    echo "no ready action succeeded; failed: $(IFS=,; echo "${failed[*]}")"
+    return 1
+  fi
+  cmd_next "$@" || true
+  return 1
+}
+
+cmd_converge() {
+  local steps=0 attempts=0 failed=()
+  while :; do
+    build_plan
+    local next
+    if ! next=$(first_ready); then break; fi
+    IFS='|' read -r action target detail <<<"$next"
+    echo "${C_BLD}[step $((attempts + 1))] $action $target${C_OFF} — $detail"
+    # Subshell so a failing action (e.g. a push rejected because the remote
+    # moved) reports and is skipped instead of killing the whole run.
+    if (run_action "$action" "$target"); then
+      steps=$((steps + 1))
+    else
+      SKIP["$action|$target"]=1
+      failed+=("$action $target")
+      echo "${C_YLW}$action $target failed; continuing with the remaining work${C_OFF}"
+    fi
+    attempts=$((attempts + 1))
+    $DRY_RUN && { echo "(dry run: stopping after first step; state would change)"; return 0; }
+    [ $attempts -lt 100 ] || die "too many steps; giving up"
+    # refresh state that actions changed
+    refresh_state
+  done
+  echo
+  local entry state action target detail work=0 notes=()
+  for entry in ${PLAN[@]+"${PLAN[@]}"}; do
+    IFS='|' read -r state action target detail <<<"$entry"
+    if [ "$state" = WARN ]; then
+      notes+=("  note: $action $target — $detail")
+    else
+      work=$((work + 1))
+    fi
+  done
+  if [ "$work" -eq 0 ] && [ ${#failed[@]} -eq 0 ]; then
+    if $LOCAL; then
+      echo "${C_GRN}Locally converged after $steps step(s): working-tree locks are at the pushed sibling tips; nothing committed or pushed.${C_OFF}"
+    else
+      echo "${C_GRN}Converged after $steps step(s).${C_OFF}"
+    fi
+    local n
+    for n in ${notes[@]+"${notes[@]}"}; do echo "${C_YLW}$n${C_OFF}"; done
+  else
+    echo "${C_YLW}Stopped after $steps step(s); remaining blockers:${C_OFF}"
+    for entry in "${PLAN[@]}"; do
+      IFS='|' read -r state action target detail <<<"$entry"
+      [ "$state" = WARN ] && continue
+      echo "  $action $target — $detail"
+    done
+    local f n
+    for f in ${failed[@]+"${failed[@]}"}; do
+      echo "  $f — failed this run (see message above)"
+    done
+    for n in ${notes[@]+"${notes[@]}"}; do echo "${C_YLW}$n${C_OFF}"; done
+    return 1
+  fi
+}
+
+pull_sub() { # down-sync one submodule ($1 = path rel to $ROOT) to the pointer recorded in tree-ish $2
+  local path=$1 ptr_ref=$2 name dir target
+  name=$(basename "$path") dir=$ROOT/$path
+  [ -e "$dir/.git" ] || { PULL_HELD+=("$name: not initialized"); return 0; }
+  target=$(git -C "$ROOT" ls-tree "$ptr_ref" -- "$path" | awk '{print $3}')
+  [ -n "$target" ] || return 0 # in .gitmodules but not in the tree
+  local default
+  default=$(git -C "$dir" symbolic-ref --quiet --short refs/remotes/origin/HEAD || echo origin/main)
+  default=${default#origin/}
+  local cur
+  cur=$(git -C "$dir" symbolic-ref --quiet --short HEAD || echo "(detached)")
+  if [ "$cur" != "(detached)" ] && [ "$cur" != "$default" ]; then
+    PULL_HELD+=("$name: parked on branch $cur; not touching it")
+    return 0
+  fi
+  if ! git -C "$dir" cat-file -e "$target^{commit}" 2>/dev/null; then
+    run git -C "$dir" fetch --quiet || true
+    if ! $DRY_RUN && ! git -C "$dir" cat-file -e "$target^{commit}" 2>/dev/null; then
+      PULL_HELD+=("$name: recorded pointer ${target:0:12} not found even after fetch")
+      return 0
+    fi
+  fi
+  local head base=""
+  head=$(git -C "$dir" rev-parse HEAD)
+  git -C "$dir" show-ref --verify --quiet "refs/heads/$default" \
+    && base=$(git -C "$dir" rev-parse "refs/heads/$default")
+  # Attaching and fast-forwarding move working-tree files unless everything
+  # already sits at the pointer, so tracked dirt only survives the no-move
+  # case (untracked files never block).
+  local dirty=0 line
+  while IFS= read -r line; do
+    case ${line:0:2} in '??') continue ;; *) dirty=$((dirty + 1)) ;; esac
+  done < <(git -C "$dir" status --porcelain)
+  if [ "$dirty" -gt 0 ] && { [ "$head" != "$target" ] || { [ -n "$base" ] && [ "$base" != "$target" ]; }; }; then
+    PULL_HELD+=("$name: $dirty uncommitted change(s) and syncing would move files; commit or stash first")
+    return 0
+  fi
+  if [ -z "$base" ]; then
+    # no local default branch yet (fresh init): create it at the pointer
+    if ! run git -C "$dir" checkout --quiet -b "$default" "$target"; then
+      PULL_HELD+=("$name: creating branch $default at ${target:0:12} failed")
+      return 0
+    fi
+    if git -C "$dir" rev-parse --quiet --verify "refs/remotes/origin/$default" >/dev/null; then
+      run git -C "$dir" branch --quiet --set-upstream-to "origin/$default" "$default" || true
+    fi
+    PULL_SYNCED=$((PULL_SYNCED + 1))
+  elif ! git -C "$dir" merge-base --is-ancestor "$base" "$target"; then
+    if git -C "$dir" merge-base --is-ancestor "$target" "$base"; then
+      # local default is ahead of the pointer (unpushed work, or a pull
+      # mid-convergence): attach to it and leave the extra commits alone
+      if [ "$cur" = "(detached)" ] && ! run git -C "$dir" checkout --quiet "$default"; then
+        PULL_HELD+=("$name: checkout $default failed")
+        return 0
+      fi
+      PULL_NOTES+=("$name: $default is ahead of the recorded pointer; left at $default")
+    else
+      PULL_HELD+=("$name: $default and the recorded pointer have diverged; rebase/resolve by hand")
+    fi
+  else
+    if [ "$cur" = "(detached)" ] && ! run git -C "$dir" checkout --quiet "$default"; then
+      PULL_HELD+=("$name: checkout $default failed")
+      return 0
+    fi
+    if [ "$base" != "$target" ]; then
+      if ! run git -C "$dir" merge --ff-only --quiet "$target"; then
+        PULL_HELD+=("$name: fast-forward of $default to ${target:0:12} failed")
+        return 0
+      fi
+    fi
+    PULL_SYNCED=$((PULL_SYNCED + 1))
+  fi
+  # The invariant pull relies on: a recorded pointer is a pushed default-tip
+  # once CI convergence finishes. A mismatch means convergence is mid-flight
+  # (or this checkout's pointer is ahead) — worth a note, not a hold.
+  local remote
+  remote=$(git -C "$dir" rev-parse --quiet --verify "refs/remotes/origin/$default" || true)
+  if [ -n "$remote" ] && [ "$remote" != "$target" ]; then
+    PULL_NOTES+=("$name: recorded pointer differs from origin/$default — CI convergence may be mid-flight; rerun pull later")
+  fi
+  return 0
+}
+
+cmd_pull() {
+  # Down-sync counterpart to converge: bring this checkout to the published
+  # state instead of publishing local state. Generic git must detach
+  # submodule HEADs (a gitlink is only a pin), but this workspace guarantees
+  # more: after CI convergence, every recorded pointer is the pushed tip of
+  # its submodule's default branch, so re-attaching each submodule to that
+  # branch fast-forwarded to the pointer is well-defined. Everything moves
+  # by fast-forward only; whatever can't (dirty, diverged, parked on a
+  # topic branch) is held and reported, never touched.
+  [ $# -eq 0 ] || { usage >&2; exit 2; }
+  ! $LOCAL || die "pull moves branch refs; it has no --local mode"
+  [ "${BRANCH[$WS]}" != "(detached)" ] || die "workspace is on a detached HEAD; check out a branch first"
+  [ "${HAS_UPSTREAM[$WS]}" = yes ] || die "workspace branch ${BRANCH[$WS]} has no upstream to pull from"
+  [ -z "${DIRTY[$WS]}" ] || die "workspace has ${DIRTY[$WS]}; commit or stash first"
+  local ptr_ref=HEAD
+  if [ "${BEHIND[$WS]}" -gt 0 ]; then
+    run git -C "$ROOT" merge --ff-only --quiet '@{u}' \
+      || die "cannot fast-forward the workspace past its upstream: it has diverged (run git pull --rebase from the workspace root) or dirty files conflict"
+    # dry run: the merge didn't happen, so read pointers from where it
+    # would have landed
+    $DRY_RUN && ptr_ref='@{u}'
+    echo "${C_GRN}workspace fast-forwarded to the tip of ${BRANCH[$WS]}'s upstream${C_OFF}"
+  else
+    echo "workspace already current with its upstream"
+  fi
+  if [ "${AHEAD[$WS]}" -gt 0 ]; then
+    echo "${C_YLW}note: workspace has ${AHEAD[$WS]} unpushed commit(s); recorded pointers may be ahead of the remotes${C_OFF}"
+  fi
+  local key path missing=()
+  while read -r key path; do
+    [ -e "$ROOT/$path/.git" ] || missing+=("$path")
+  done < <(git config -f "$ROOT/.gitmodules" --get-regexp '^submodule\..*\.path$')
+  if [ ${#missing[@]} -gt 0 ]; then
+    run git -C "$ROOT" submodule update --init -- "${missing[@]}" \
+      || echo "${C_YLW}warning: submodule init failed; the failed one(s) will be held${C_OFF}"
+  fi
+  local PULL_SYNCED=0 PULL_HELD=() PULL_NOTES=() # written by pull_sub (dynamic scoping)
+  while read -r key path; do
+    pull_sub "$path" "$ptr_ref"
+  done < <(git config -f "$ROOT/.gitmodules" --get-regexp '^submodule\..*\.path$')
+  echo
+  local n
+  for n in ${PULL_NOTES[@]+"${PULL_NOTES[@]}"}; do echo "${C_YLW}note: $n${C_OFF}"; done
+  if [ ${#PULL_HELD[@]} -eq 0 ]; then
+    echo "${C_GRN}Pulled: workspace current; $PULL_SYNCED submodule(s) on their default branch at the recorded pointer.${C_OFF}"
+  else
+    echo "${C_YLW}Pulled what was safe ($PULL_SYNCED submodule(s)); held:${C_OFF}"
+    local h
+    for h in "${PULL_HELD[@]}"; do echo "  $h"; done
+    return 1
+  fi
+}
+
+cmd_check() {
+  # Run every repo's `nix flake check` against its *current* locks: the same
+  # gate update-pins applies to proposed pin states, but with no overrides
+  # and nothing written — a read-only "does the whole system still check"
+  # sweep. Failures don't stop the sweep; the summary names them and the
+  # exit status reports whether everything passed.
+  local target=""
+  case $# in
+    0) ;;
+    1) target=$1; [ -n "${DIR[$target]:-}" ] || die "unknown repo '$1'" ;;
+    *) usage >&2; exit 2 ;;
+  esac
+  [ "$CHECK_MODE" != none ] || die "check with --check=none would check nothing (use eval or full)"
+  local check_flags=(--no-write-lock-file)
+  [ "$CHECK_MODE" = eval ] && check_flags+=(--no-build)
+  local repo dir sub fd flakedir label passed=0 failed=()
+  for repo in "${TOPO[@]}"; do
+    [ -z "$target" ] || [ "$repo" = "$target" ] || continue
+    dir=${DIR[$repo]}
+    local fds=(".")
+    if $WITH_PARTITIONS; then
+      while IFS= read -r sub; do
+        fd=$(dirname "$sub")
+        [ -f "$dir/$fd/flake.nix" ] && fds+=("$fd")
+      done < <(git -C "$dir" ls-files -- '*/flake.lock')
+    fi
+    for fd in "${fds[@]}"; do
+      flakedir=$dir label=$repo
+      if [ "$fd" != "." ]; then flakedir=$dir/$fd label=$repo:$fd; fi
+      if run nix flake check "$flakedir" "${check_flags[@]}"; then
+        $DRY_RUN || echo "${C_GRN}check passed: $label${C_OFF}"
+        passed=$((passed + 1))
+      else
+        echo "${C_RED}check FAILED: $label${C_OFF}"
+        failed+=("$label")
+      fi
+    done
+  done
+  [ $((passed + ${#failed[@]})) -gt 0 ] || die "no flakes to check"
+  $DRY_RUN && return 0
+  echo
+  if [ ${#failed[@]} -eq 0 ]; then
+    echo "${C_GRN}All checks passed: $passed flake(s), --check=$CHECK_MODE.${C_OFF}"
+  else
+    echo "${C_RED}${#failed[@]} of $((passed + ${#failed[@]})) flake check(s) failed: $(IFS=,; echo "${failed[*]}")${C_OFF}"
+    return 1
+  fi
+}
+
+cmd_graph() {
+  local repo dep
+  echo "topological order (dependencies first):"
+  for repo in "${TOPO[@]}"; do
+    local deps="${DEPS[$repo]:-}"
+    printf "  %-22s" "$repo"
+    [ -n "${deps// /}" ] && echo "<- ${deps% }" || echo "(no local deps)"
+  done
+}
+
+# ------------------------------------------------------------------- main
+
+CMD=""
+ARGS=()
+for arg in "$@"; do
+  case $arg in
+    -n | --dry-run) DRY_RUN=true ;;
+    --check | --check=eval) CHECK_MODE="eval" ;;
+    --check=none) CHECK_MODE=none ;;
+    --check=full) CHECK_MODE=full ;;
+    --check=*) die "invalid --check mode '${arg#--check=}' (use none, eval, or full)" ;;
+    --fetch) DO_FETCH=true ;;
+    --local) LOCAL=true ;;
+    --with-partitions) WITH_PARTITIONS=true ;;
+    --with-tests) WITH_TESTS=true ;;
+    --with-external) WITH_EXTERNAL=true ;;
+    --all) WITH_PARTITIONS=true WITH_TESTS=true WITH_EXTERNAL=true ;;
+    -h | --help) usage; exit 0 ;;
+    -*) die "unknown option '$arg' (see --help)" ;;
+    *) if [ -z "$CMD" ]; then CMD=$arg; else ARGS+=("$arg"); fi ;;
+  esac
+done
+[ -n "$CMD" ] || { usage >&2; exit 2; }
+
+command -v jq >/dev/null || die "jq is required"
+
+# pull without fetching would sync to yesterday's remote state
+[ "$CMD" != pull ] || DO_FETCH=true
+
+load_state
+
+case $CMD in
+  status) cmd_status "${ARGS[@]}" ;;
+  next) cmd_next "${ARGS[@]}" ;;
+  step) cmd_step "${ARGS[@]}" ;;
+  converge) cmd_converge "${ARGS[@]}" ;;
+  pull) cmd_pull "${ARGS[@]}" ;;
+  check) cmd_check "${ARGS[@]}" ;;
+  graph) cmd_graph "${ARGS[@]}" ;;
+  *) die "unknown command '$CMD' (see --help)" ;;
+esac

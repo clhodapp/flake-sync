@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: MIT
 {
 
-  description = "Nix package for ch-nix-workspace's scripts/flake-sync";
+  description = "Assess and converge a workspace's flake repos in DAG order";
 
   inputs = {
     ch-flake.url = "github:clhodapp/ch-flake";

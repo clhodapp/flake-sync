@@ -75,11 +75,15 @@
           { pkgs, system, ... }:
           {
             checks = {
-              # Building the package proves its declared closure
-              # (git/gh/nix/jq) is complete; it cannot exercise
-              # scripts/flake-sync's own logic since no workspace
-              # checkout exists inside the Nix build sandbox.
+              # Building the package proves its declared runtime closure
+              # is complete and shellchecks the script.
               package = self.packages.${system}.flake-sync;
+              # Full offline lifecycle test against a fake GitHub of
+              # local bare repos, driving the packaged executable.
+              vm-lifecycle = import ../../../tests/vm {
+                inherit pkgs;
+                flake-sync = self.packages.${system}.flake-sync;
+              };
             };
           };
       };
