@@ -4,40 +4,30 @@
   description = "Assess and converge a workspace's flake repos in DAG order";
 
   inputs = {
-    ch-flake.url = "github:clhodapp/ch-flake";
+    caisson.url = "github:nix-caisson/caisson";
     ch-nixpkgs.url = "github:clhodapp/ch-nixpkgs";
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
-
-    flake-parts.follows = "ch-flake/flake-parts";
   };
 
   outputs =
-    inputs@{
-      ch-flake,
-      flake-parts,
-      self,
-      ...
-    }:
+    inputs@{ caisson, ... }:
     let
-      lib = ch-flake.lib.mkLib {
+      lib = caisson.lib.caisson-core.mkLib {
         inherit inputs;
 
-        modules = lib: {
-          flake = {
-            default = lib.ch-flake.mkFlakeModule ./modules/flake-parts/default;
-            partitions = flake-parts.flakeModules.partitions;
-          };
+        projects = {
+          inherit caisson;
+          ch-nixpkgs = inputs.ch-nixpkgs;
         };
 
         libOverlays = mkLibOverlay: {
           default = mkLibOverlay ./lib-overlays/default;
-          ch-nixpkgs = inputs.ch-nixpkgs.libOverlays.default;
         };
       };
     in
-    lib.ch-flake.mkFlake {
+    lib.caisson.mkFlake {
       name = "flake-sync";
-      configModule = lib.ch-flake.mkFlakeModule ./configs/flake-parts/default;
+      configModule = lib.caisson.mkFlakeModule ./configs/flake-parts/default;
     };
 
 }
