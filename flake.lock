@@ -15,39 +15,6 @@
         "type": "github"
       }
     },
-    "caisson_2": {
-      "locked": {
-        "lastModified": 1788424022,
-        "narHash": "sha256-O5L156uTgGIjBlD9R4uTl4cGAfTa1SiWZRSZBneF7Lo=",
-        "owner": "nix-caisson",
-        "repo": "caisson",
-        "rev": "7eb1bd6270d2a38c6f7973dae3288841cbece3e4",
-        "type": "github"
-      },
-      "original": {
-        "owner": "nix-caisson",
-        "repo": "caisson",
-        "type": "github"
-      }
-    },
-    "ch-nixpkgs": {
-      "inputs": {
-        "caisson": "caisson_2"
-      },
-      "locked": {
-        "lastModified": 1788424039,
-        "narHash": "sha256-sok/44kXqfj2hVM2S+pALzFK6+gdAvFHKTSW2iMjReM=",
-        "owner": "clhodapp",
-        "repo": "ch-nixpkgs",
-        "rev": "76f99be67addd45cba13ed516ecfde930b252c59",
-        "type": "github"
-      },
-      "original": {
-        "owner": "clhodapp",
-        "repo": "ch-nixpkgs",
-        "type": "github"
-      }
-    },
     "nixpkgs": {
       "locked": {
         "lastModified": 1788039129,
@@ -67,7 +34,6 @@
     "root": {
       "inputs": {
         "caisson": "caisson",
-        "ch-nixpkgs": "ch-nixpkgs",
         "nixpkgs": "nixpkgs"
       }
     }
