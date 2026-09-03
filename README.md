@@ -72,6 +72,14 @@ time. `nix flake check` builds the package and an offline NixOS VM test
 convergence lifecycle against a fake GitHub of local bare repos;
 `nix fmt` formats.
 
+## Stability
+
+`main` rolls. There are no tagged releases, and the command surface may
+change; pin a revision if you need one that stays put. The command names
+and their exit-status conventions (`converge` exiting 1 to report
+blockers rather than to signal a crash) are the parts least likely to
+move.
+
 ## License
 
 MIT, see [`LICENSE`](LICENSE).
