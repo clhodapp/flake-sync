@@ -18,7 +18,12 @@ permissions: {}
 
 jobs:
   dispatch:
-    if: "!startsWith(github.event.head_commit.message, 'maint: update flake pins')"
+    # The app credentials exist only on the upstream repo, so a fork
+    # pushing to its own main would fail this job rather than skip it.
+    # Guard on the repository so forks stay green.
+    if: >-
+      github.repository == 'clhodapp/flake-sync' &&
+      !startsWith(github.event.head_commit.message, 'maint: update flake pins')
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:

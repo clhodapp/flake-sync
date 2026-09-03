@@ -8,6 +8,14 @@ current HEAD, every repo is pushed, and the workspace's submodule
 pointers match submodule HEADs. Repos and cross-repo pins are discovered
 from `.gitmodules` and the lock files; nothing is hardcoded.
 
+The problem it solves: once a set of flakes pins each other by revision,
+landing one change means pushing the dependency, re-locking each
+consumer against the new revision, pushing those, and repeating down the
+graph. Doing that by hand means sequencing pushes correctly and editing
+lock files, and getting it wrong leaves consumers pinned to revisions
+that no longer build. flake-sync works out the order from the repos
+themselves and runs it.
+
 ```sh
 flake-sync status      # git and pin state of every repo, pending actions
 flake-sync converge    # run ready actions until converged or blocked
@@ -15,6 +23,30 @@ flake-sync check       # read-only nix flake check sweep over every repo
 flake-sync pull        # down-sync a checkout the remotes moved past
 flake-sync graph       # the dependency DAG in topological order
 ```
+
+## Install
+
+Run it without installing anything:
+
+```sh
+nix run github:clhodapp/flake-sync -- status
+```
+
+Add it to a dev shell, so everyone working in the workspace has the same
+version:
+
+```nix
+{
+  inputs.flake-sync.url = "github:clhodapp/flake-sync";
+
+  # in your devShell:
+  #   packages = [ inputs.flake-sync.packages.${system}.flake-sync ];
+}
+```
+
+`nix profile install github:clhodapp/flake-sync` puts it on `PATH`
+permanently. It needs `git` and `nix` at runtime, both of which the
+package carries in its own closure.
 
 The workspace is found from the current directory: the enclosing git
 repo, walked up to the parent-most repo that tracks it as a submodule. A
@@ -39,3 +71,15 @@ time. `nix flake check` builds the package and an offline NixOS VM test
 (`tests/vm/`) that drives the packaged executable through a full
 convergence lifecycle against a fake GitHub of local bare repos;
 `nix fmt` formats.
+
+## Stability
+
+`main` rolls. There are no tagged releases, and the command surface may
+change; pin a revision if you need one that stays put. The command names
+and their exit-status conventions (`converge` exiting 1 to report
+blockers rather than to signal a crash) are the parts least likely to
+move.
+
+## License
+
+MIT, see [`LICENSE`](LICENSE).
