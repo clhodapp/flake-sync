@@ -20,7 +20,7 @@
     libOverlays.exported = libOverlays: { inherit (libOverlays) default; };
   };
 
-  ch-nixpkgs = {
+  caisson.nixpkgs = {
     overlays.all = {
       packages = lib.caisson.nixpkgs.mkPackagesOverlay (
         { callPackage, ... }: import ../../../pkgs/flake-sync { inherit callPackage; }
