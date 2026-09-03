@@ -203,7 +203,7 @@ landing changes that didn't go through the gate.
 - **Detached HEADs block everything mutating.** Submodules checked out by
   `git submodule update` are detached, and `update-pins`/`push` refuse to
   run there — otherwise the commits would strand. Check out the real
-  branch first: `git -C projects/<name> checkout main` (verify main
+  branch first: `git -C <submodule-path> checkout main` (verify main
   matches the recorded pointer before doing this in a checkout you don't
   own).
 - **Pins advance only to pushed revs, and only past the check gate — but a

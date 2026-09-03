@@ -39,6 +39,15 @@
     packages.export.enabled = true;
   };
 
+  # `nix run github:clhodapp/flake-sync` is the first thing a reader of
+  # the README tries, and it needs packages.default to resolve. This
+  # repo ships exactly one program, so the alias is unambiguous.
+  perSystem =
+    { config, ... }:
+    {
+      packages.default = config.packages.flake-sync;
+    };
+
   partitionedAttrs.checks = "checks";
   partitionedAttrs.formatter = "formatter";
 
