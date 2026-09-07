@@ -525,6 +525,35 @@ git -C projects/app checkout -q -- README.md
 assert_converged "converged after the pull scenarios"
 echo "ok: pull held the diverged branch, synced siblings, and tolerated no-move dirt"
 
+echo "=== 18b. pull --heads reaches the remote tips before convergence records them"
+# A landing nobody has converged yet: lib's main moves on the hub, and no
+# pin commit or pointer bump follows it.
+side=$(mktemp -d)/lib
+git clone -q "$HUB/lib.git" "$side"
+echo heads >>"$side/README.md"
+git -C "$side" commit -aqm "feat: lib change nobody has converged yet"
+git -C "$side" push -q
+out=$($FS pull)
+expect_contains "$out" "CI convergence may be mid-flight" "plain pull notes the lagging pointer"
+[ "$(head_rev projects/lib)" != "$(hub_rev lib)" ] || fail "plain pull must stay at the recorded pointer"
+rc=0; out=$($FS converge --heads 2>&1) || rc=$?
+[ "$rc" -ne 0 ] || fail "--heads must be rejected outside pull"
+out=$($FS pull --heads)
+expect_contains "$out" "Pulled" "pull --heads reports success"
+expect_contains "$out" "past the recorded pointer" "the lagging pointer is a note, not a hold"
+[ "$(head_rev projects/lib)" = "$(hub_rev lib)" ] || fail "lib should sit at the hub tip"
+[ "$(git -C projects/lib symbolic-ref --short HEAD)" = main ] || fail "lib should be on main, not detached"
+[ "$(head_rev projects/app)" = "$(hub_rev app)" ] || fail "app should still sit at its tip"
+# From the remotes' state, local convergence writes the lock the next
+# convergence run will commit (exit 1 is expected: app's new lock is
+# unpushed, so machines is held).
+rc=0; $FS converge --local >/dev/null || rc=$?
+[ "$(lock_rev projects/app lib)" = "$(hub_rev lib)" ] \
+  || fail "converge --local should re-pin app to lib's tip after pull --heads"
+$FS converge >/dev/null
+assert_converged "converged after the pull --heads scenario"
+echo "ok: pull --heads reached the remote tips and local convergence followed"
+
 echo "=== 19. root discovery follows the cwd"
 # A submodule cwd resolves to the enclosing workspace: status run from
 # inside projects/lib still sees every repo, machines included.

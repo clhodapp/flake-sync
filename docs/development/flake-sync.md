@@ -143,6 +143,26 @@ mid-flight, rerun `pull` once it lands. The workspace itself must be on a
 branch with an upstream and is only ever fast-forwarded; if it has
 diverged, `pull` refuses and points at `git pull --rebase`.
 
+### pull --heads: the remotes' state, ahead of the pointers
+
+```sh
+flake-sync pull --heads
+flake-sync converge --local --with-partitions
+```
+
+The recorded pointers describe the last *converged* state, so between a
+landing and the convergence run that follows it they lag the remotes:
+a subproject's `main` has moved, no pin commit or pointer bump exists
+yet. `pull --heads` syncs each submodule to `origin/<default>` instead of
+to the pointer, with the same fast-forward-only moves and the same holds,
+so the checkout reaches the remotes' state directly. That is the state
+convergence starts from, which makes the pair above a local convergence
+run: the locks `converge --local` then writes are the ones the next
+convergence commits. A convergence runner does the same before it
+converges, so `pull --heads` is that step as well. The pointers a
+`--heads` sync leaves behind are noted, not held; convergence records
+them when it lands.
+
 ## Local convergence: check and accelerate, publish nothing
 
 ```sh

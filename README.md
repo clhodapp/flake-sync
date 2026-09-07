@@ -21,6 +21,7 @@ flake-sync status      # git and pin state of every repo, pending actions
 flake-sync converge    # run ready actions until converged or blocked
 flake-sync check       # read-only nix flake check sweep over every repo
 flake-sync pull        # down-sync a checkout the remotes moved past
+flake-sync pull --heads  # ...to the remotes' tips, ahead of the recorded pointers
 flake-sync graph       # the dependency DAG in topological order
 ```
 
