@@ -63,7 +63,9 @@ Commands:
               submodule to its default branch fast-forwarded to the recorded
               pointer — no detached HEADs left behind. A submodule that is
               dirty, diverged, or parked on a topic branch is held (and
-              reported) rather than touched; exit 1 if anything held
+              reported) rather than touched; exit 1 if anything held.
+              With --heads: to origin's tip of the default branch instead
+              of the recorded pointer, the state convergence starts from
   check       Run `nix flake check` on every repo (or one: `check <repo>`)
               against its current locks — read-only: nothing is re-pinned,
               committed, or pushed. Depth follows --check (eval by default,
@@ -94,6 +96,12 @@ Options:
                         mode picks the depth of the `check` command (none
                         is rejected there)
       --fetch           git fetch every repo before assessing state
+      --heads           (pull only) Sync each submodule to origin/<default>
+                        rather than to the pointer the workspace records.
+                        The pointers lag the remotes until convergence
+                        runs; this reaches the remotes' state directly, so
+                        `converge --local` can run from it. It is the step
+                        a convergence runner takes before converging
       --local           Touch working trees only: advance pins through the
                         same check gate, but never commit, push, or bump
                         submodule pointers. Runs with dirty trees and on
@@ -138,6 +146,7 @@ EOF
 
 DRY_RUN=false
 DO_FETCH=false
+HEADS=false
 LOCAL=false
 WITH_PARTITIONS=false
 WITH_TESTS=false
@@ -1011,7 +1020,7 @@ cmd_converge() {
   fi
 }
 
-pull_sub() { # down-sync one submodule ($1 = path rel to $ROOT) to the pointer recorded in tree-ish $2
+pull_sub() { # down-sync one submodule ($1 = path rel to $ROOT) to the pointer recorded in tree-ish $2 (or, with --heads, to origin's default tip)
   local path=$1 ptr_ref=$2 name dir target
   name=$(basename "$path") dir=$ROOT/$path
   [ -e "$dir/.git" ] || { PULL_HELD+=("$name: not initialized"); return 0; }
@@ -1020,6 +1029,15 @@ pull_sub() { # down-sync one submodule ($1 = path rel to $ROOT) to the pointer r
   local default
   default=$(git -C "$dir" symbolic-ref --quiet --short refs/remotes/origin/HEAD || echo origin/main)
   default=${default#origin/}
+  # what the branch is measured against in the messages below
+  local pointer=$target goal="the recorded pointer"
+  if $HEADS; then
+    # load_state fetched every initialized submodule and a fresh init
+    # clones current, so origin/<default> is the remote's tip as of now.
+    target=$(git -C "$dir" rev-parse --quiet --verify "refs/remotes/origin/$default" || true)
+    [ -n "$target" ] || { PULL_HELD+=("$name: no origin/$default to sync to"); return 0; }
+    goal="origin/$default"
+  fi
   local cur
   cur=$(git -C "$dir" symbolic-ref --quiet --short HEAD || echo "(detached)")
   if [ "$cur" != "(detached)" ] && [ "$cur" != "$default" ]; then
@@ -1066,9 +1084,9 @@ pull_sub() { # down-sync one submodule ($1 = path rel to $ROOT) to the pointer r
         PULL_HELD+=("$name: checkout $default failed")
         return 0
       fi
-      PULL_NOTES+=("$name: $default is ahead of the recorded pointer; left at $default")
+      PULL_NOTES+=("$name: $default is ahead of $goal; left at $default")
     else
-      PULL_HELD+=("$name: $default and the recorded pointer have diverged; rebase/resolve by hand")
+      PULL_HELD+=("$name: $default and $goal have diverged; rebase/resolve by hand")
     fi
   else
     if [ "$cur" = "(detached)" ] && ! run git -C "$dir" checkout --quiet "$default"; then
@@ -1085,11 +1103,18 @@ pull_sub() { # down-sync one submodule ($1 = path rel to $ROOT) to the pointer r
   fi
   # The invariant pull relies on: a recorded pointer is a pushed default-tip
   # once CI convergence finishes. A mismatch means convergence is mid-flight
-  # (or this checkout's pointer is ahead) — worth a note, not a hold.
+  # (or this checkout's pointer is ahead): worth a note, not a hold. With
+  # --heads the mismatch is the point: the checkout is ahead of the pointers
+  # on purpose, and convergence records them when it lands.
+  if $HEADS; then
+    [ "$target" = "$pointer" ] \
+      || PULL_NOTES+=("$name: origin/$default is past the recorded pointer; convergence records it when it lands")
+    return 0
+  fi
   local remote
   remote=$(git -C "$dir" rev-parse --quiet --verify "refs/remotes/origin/$default" || true)
   if [ -n "$remote" ] && [ "$remote" != "$target" ]; then
-    PULL_NOTES+=("$name: recorded pointer differs from origin/$default — CI convergence may be mid-flight; rerun pull later")
+    PULL_NOTES+=("$name: recorded pointer differs from origin/$default; CI convergence may be mid-flight: rerun pull later, or pull --heads to sync to the remotes now")
   fi
   return 0
 }
@@ -1137,8 +1162,10 @@ cmd_pull() {
   echo
   local n
   for n in ${PULL_NOTES[@]+"${PULL_NOTES[@]}"}; do echo "${C_YLW}note: $n${C_OFF}"; done
+  local at="the recorded pointer"
+  $HEADS && at="origin's tip"
   if [ ${#PULL_HELD[@]} -eq 0 ]; then
-    echo "${C_GRN}Pulled: workspace current; $PULL_SYNCED submodule(s) on their default branch at the recorded pointer.${C_OFF}"
+    echo "${C_GRN}Pulled: workspace current; $PULL_SYNCED submodule(s) on their default branch at $at.${C_OFF}"
   else
     echo "${C_YLW}Pulled what was safe ($PULL_SYNCED submodule(s)); held:${C_OFF}"
     local h
@@ -1218,6 +1245,7 @@ for arg in "$@"; do
     --check=full) CHECK_MODE=full ;;
     --check=*) die "invalid --check mode '${arg#--check=}' (use none, eval, or full)" ;;
     --fetch) DO_FETCH=true ;;
+    --heads) HEADS=true ;;
     --local) LOCAL=true ;;
     --with-partitions) WITH_PARTITIONS=true ;;
     --with-tests) WITH_TESTS=true ;;
@@ -1234,6 +1262,7 @@ command -v jq >/dev/null || die "jq is required"
 
 # pull without fetching would sync to yesterday's remote state
 [ "$CMD" != pull ] || DO_FETCH=true
+[ "$CMD" = pull ] || ! $HEADS || die "--heads applies to pull only"
 
 load_state
 
