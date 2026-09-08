@@ -73,6 +73,32 @@ time. `nix flake check` builds the package and an offline NixOS VM test
 convergence lifecycle against a fake GitHub of local bare repos;
 `nix fmt` formats.
 
+In CI the same `nix flake check` runs with the Nix store cached between
+runs. A pull request that leaves `.github/` alone is checked by `main`'s
+copy of the workflow, in `main`'s context once its own check completes,
+and adds its build to the shared cache; one that changes the pipeline is
+checked by its own copy, under a cache only it can see. The comments at
+the top of the two workflow files say why that split is what makes the
+cache safe to write from a pull request.
+
+## Binary cache
+
+What `main` builds is pushed to the `clhodapp` cachix cache, signed with
+its key, so `nix run github:clhodapp/flake-sync` at the same pins
+downloads the packaged tool instead of building it. That cache skips
+paths its upstreams already hold, so using it means using them too:
+
+| Substituter | Public key |
+|---|---|
+| `https://clhodapp.cachix.org` | `clhodapp.cachix.org-1:EW/0conxH0OQyo0o4ub/grdkFspholmQMSnQyj0vrZI=` |
+| `https://nix-community.cachix.org` | `nix-community.cachix.org-1:mB9FSh9qf2dCimDSUo8Zy7bkq5CX+/rkCWyvRCYg3Fs=` |
+| `https://numtide.cachix.org` | `numtide.cachix.org-1:2ps1kLBUWjxIneOy1Ik6cQjb41X0iXVXeHigGmycPPE=` |
+
+Add all three to `extra-substituters` and `extra-trusted-public-keys`.
+The flake also declares them in `nixConfig`, which applies when it is
+evaluated directly and the prompt (or `--accept-flake-config`) accepts
+them.
+
 ## Stability
 
 `main` rolls. There are no tagged releases, and the command surface may
