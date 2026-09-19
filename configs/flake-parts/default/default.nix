@@ -10,11 +10,6 @@
 {
 
   debug = false;
-  systems = [
-    "x86_64-linux"
-    "aarch64-linux"
-  ];
-
   caisson = {
     configInfo.configName = "flake-sync";
     libOverlays.exported = libOverlays: { inherit (libOverlays) default; };
