@@ -37,6 +37,7 @@
           "x86_64-linux"
           "aarch64-linux"
         ];
+        defaultEcosystemSrc.nixpkgs = inputs.nixpkgs;
 
         projects = {
           inherit caisson;
