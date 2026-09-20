@@ -26,6 +26,8 @@
   inputs = {
     caisson.url = "github:nix-caisson/caisson";
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
+    flake-parts.url = "github:hercules-ci/flake-parts";
+    flake-parts.inputs.nixpkgs-lib.follows = "nixpkgs";
   };
 
   outputs =
@@ -37,8 +39,6 @@
           "x86_64-linux"
           "aarch64-linux"
         ];
-        defaultEcosystemSrc.nixpkgs = inputs.nixpkgs;
-
         projects = {
           inherit caisson;
         };
