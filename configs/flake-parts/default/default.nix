@@ -13,7 +13,6 @@
 
   debug = false;
   caisson = {
-    configInfo.configName = "flake-sync";
     libOverlays.exported = libOverlays: { inherit (libOverlays) default; };
   };
 

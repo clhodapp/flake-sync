@@ -35,6 +35,7 @@
     let
       lib = caisson.lib.caisson-core.mkLib {
         inherit inputs;
+        namespace = "flake-sync";
         systems = [
           "x86_64-linux"
           "aarch64-linux"
@@ -43,13 +44,10 @@
           inherit caisson;
         };
 
-        libOverlays = mkLibOverlay: {
-          default = mkLibOverlay ./lib-overlays/default;
-        };
+        libOverlays = caisson.lib.caisson-core.mkLibOverlays ./lib-overlays;
       };
     in
     lib.caisson.flake-parts.mkConfiguration {
-      name = "flake-sync";
       configModule = lib.caisson.flake-parts.mkModule ./configs/flake-parts/default;
     };
 
