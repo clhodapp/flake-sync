@@ -10,7 +10,7 @@ build if the script has a shellcheck error or calls a program that is
 not declared in `runtimeInputs`.
 
 Everything else in the repo is scaffolding: `pkgs/` packages the script,
-`configs/flake-parts/` wires the flake outputs, and `tests/vm/` is the
+`configs/flake/` wires the flake outputs, and `tests/vm/` is the
 lifecycle test.
 
 ## Working on it
