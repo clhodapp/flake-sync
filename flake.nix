@@ -47,6 +47,7 @@
         configs = caisson.lib.caisson-core.mkModules ./configs;
 
         libOverlays = caisson.lib.caisson-core.mkLibOverlays ./lib-overlays;
+        pkgOverlays = caisson.lib.caisson-core.mkPkgOverlays ./pkg-overlays;
       };
     in
     lib.caisson.flake-parts.mkConfiguration {

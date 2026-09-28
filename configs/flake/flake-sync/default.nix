@@ -16,22 +16,12 @@
     libOverlays.exported = libOverlays: { inherit (libOverlays) default; };
   };
 
+  # The tool's package is the `default` entry of this flake's package
+  # overlay registry (pkg-overlays/, registered on mkLib): the package set
+  # applies it by default, and the flake exports it as `pkgOverlays` and
+  # as the plain `overlays.default`.
   caisson.nixpkgs = {
-    overlays.all = {
-      packages = lib.caisson.nixpkgs.mkPackagesOverlay (
-        { callPackage, ... }: import ../../../pkgs/flake-sync { inherit callPackage; }
-      );
-    };
-    overlays.export = {
-      enabled = true;
-    };
-    overlays.exported = overlays: {
-      inherit (overlays) packages;
-    };
-    pkgSets.pkgs = {
-      pkgFunction = import inputs.nixpkgs;
-      overlayImports = overlays: [ overlays.packages ];
-    };
+    pkgSets.pkgs.pkgFunction = import inputs.nixpkgs;
     packages.export.enabled = true;
   };
 

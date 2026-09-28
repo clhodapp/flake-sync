@@ -3,19 +3,19 @@
 ## The shape of the thing
 
 The tool is one bash script,
-`pkgs/flake-sync/flake-sync/flake-sync`, using `jq` for JSON. It is
+`pkg-overlays/default/packages/flake-sync/flake-sync`, using `jq` for JSON. It is
 packaged with `writeShellApplication`, which shellchecks it as part of
 the build and pins its runtime dependencies, so the package cannot
 build if the script has a shellcheck error or calls a program that is
 not declared in `runtimeInputs`.
 
-Everything else in the repo is scaffolding: `pkgs/` packages the script,
+Everything else in the repo is scaffolding: `pkg-overlays/` packages the script,
 `configs/flake/` wires the flake outputs, and `tests/vm/` is the
 lifecycle test.
 
 ## Working on it
 
-While editing, `bash -n pkgs/flake-sync/flake-sync/flake-sync` is the
+While editing, `bash -n pkg-overlays/default/packages/flake-sync/flake-sync` is the
 quick syntax pass. Then:
 
 ```sh
@@ -52,7 +52,7 @@ while developing a scenario:
 ```sh
 T=$(mktemp -d)
 HUB=$T/hub WORK=$T/workspace bash tests/vm/fixture.sh
-HUB=$T/hub WORK=$T/workspace FLAKE_SYNC=$PWD/pkgs/flake-sync/flake-sync/flake-sync \
+HUB=$T/hub WORK=$T/workspace FLAKE_SYNC=$PWD/pkg-overlays/default/packages/flake-sync/flake-sync \
   bash tests/vm/scenarios.sh
 ```
 
