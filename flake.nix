@@ -35,7 +35,7 @@
     let
       lib = caisson.lib.caisson-core.mkLib {
         inherit (caisson.lib.caisson-core.pins.flake inputs) sources root;
-        namespace = "flake-sync";
+        name = "flake-sync";
         systems = [
           "x86_64-linux"
           "aarch64-linux"
