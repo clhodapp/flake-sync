@@ -21,7 +21,6 @@
   # applies it by default, and the flake exports it as `pkgOverlays` and
   # as the plain `overlays.default`.
   caisson.nixpkgs = {
-    pkgSets.pkgs.pkgFunction = import inputs.nixpkgs;
     packages.export.enabled = true;
   };
 
