@@ -49,7 +49,7 @@ hub_url() { echo "git+file://$HUB/$1.git"; }
 
 mkrepo() { # $1 = name; remaining args = input=url pairs.
   # DEVDEPS (input=url pairs, space-separated) adds a partition-style
-  # tests/dependencies subflake with its own tracked lock.
+  # tests/dependencies subflake with a separate tracked lock.
   local name=$1; shift
   local dir=$BUILD/$name
   mkdir -p "$dir"

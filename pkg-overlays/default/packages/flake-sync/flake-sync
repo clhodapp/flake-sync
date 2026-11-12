@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
 # SPDX-License-Identifier: MIT
 #
-# flake-sync — assess and converge the workspace's flake repos in DAG order.
+# flake-sync: assess and converge the workspace's flake repos in DAG order.
 #
 # The workspace is found from the caller's cwd: the enclosing git repo,
 # walked up to the parent-most repo that tracks it as a submodule (a repo
-# that is nobody's submodule is its own workspace; a cwd outside any git
-# repo is an error).
+# that is nobody's submodule is a workspace by itself; a cwd outside any
+# git repo is an error).
 #
 # The workspace is a git repo with flake submodules that pin each other via
 # github: inputs in their flake.locks. Convergence means: every repo's local
@@ -28,18 +28,18 @@
 # set is tried first (one check, and the only trial that can pass pins
 # that must move jointly, e.g. siblings sharing a ch-flake rev); if it
 # fails, stale targets are tried cumulatively in dependency order, and a
-# failing or unpushed target holds back only its own pins: whatever passes
+# failing or unpushed target holds back only the pins onto it: whatever passes
 # advances in one commit and the held-back remainder is reported. The
 # objective is to minimize the number of stale pins, never to bisect a
 # target's history for a partially-newer safe rev. The standalone `check`
 # command runs the same gate against every repo's *current* locks, with no
-# overrides and nothing written — a read-only sweep of the whole system.
+# overrides and nothing written: a read-only sweep of the whole system.
 #
 # With --with-external, root-level inputs that aren't siblings (nixpkgs,
 # home-manager, etc.) are managed too: one is stale if `nix flake update
 # <name>` would move its locked rev. The trial lock answering that also
 # resolves the rev such an update lands on, and advancing re-locks with a
-# fixed `--override-input` to exactly that rev — the same mechanism as
+# fixed `--override-input` to exactly that rev, the same mechanism as
 # sibling pins (there is no sibling HEAD, so the trial-resolved rev stands
 # in), so the state the check gate validated is the state that gets
 # locked. External pins have no DAG position and no unpushed-target
@@ -57,17 +57,17 @@ Commands:
   next        Print the next action that would run, without running it
   step        Run the next ready action (or a specific one, see below)
   converge    Run ready actions until converged or blocked (with --local:
-              working trees only — advance locks, commit and push nothing)
+              working trees only: advance locks, commit and push nothing)
   pull        Down-sync from the remotes: fetch, fast-forward the workspace
               to its upstream, init missing submodules, then re-attach every
               submodule to its default branch fast-forwarded to the recorded
-              pointer — no detached HEADs left behind. A submodule that is
+              pointer, leaving no detached HEADs behind. A submodule that is
               dirty, diverged, or parked on a topic branch is held (and
               reported) rather than touched; exit 1 if anything held.
               With --heads: to origin's tip of the default branch instead
               of the recorded pointer, the state convergence starts from
   check       Run `nix flake check` on every repo (or one: `check <repo>`)
-              against its current locks — read-only: nothing is re-pinned,
+              against its current locks, read-only: nothing is re-pinned,
               committed, or pushed. Depth follows --check (eval by default,
               full builds the checks); --with-partitions also checks
               partition/dev input flakes
@@ -90,7 +90,7 @@ Options:
                         errors only), or full (also builds the flake's
                         checks). The full stale set is tried first; if it
                         fails, targets are tried cumulatively in dependency
-                        order, a failing target holds back only its own pins
+                        order, a failing target holds back only the pins onto it
                         while the remaining targets are still tried, and
                         whatever passes advances in one commit. The same
                         mode picks the depth of the `check` command (none
@@ -105,8 +105,8 @@ Options:
       --local           Touch working trees only: advance pins through the
                         same check gate, but never commit, push, or bump
                         submodule pointers. Runs with dirty trees and on
-                        detached HEADs — with no commits, nothing can
-                        strand — so it works in any checkout, including
+                        detached HEADs (with no commits, nothing can
+                        strand), so it works in any checkout, including
                         agent worktrees. Pins still advance only to pushed
                         sibling revs, so the locks written are exactly the
                         ones CI convergence will commit
@@ -129,7 +129,7 @@ Options:
 
 The workspace is found from the current directory: the enclosing git repo,
 walked up to the parent-most repo that tracks it as a submodule. A repo
-that is nobody's submodule is its own workspace; a cwd outside any git
+that is nobody's submodule is a workspace by itself; a cwd outside any git
 repo is an error.
 
 Actions only run when safe: pins advance only to pushed revs (and, by
@@ -137,7 +137,7 @@ default, only if the proposed pin state passes an evaluation-only nix flake
 check), and a pin that cannot advance holds back only itself, never its
 siblings. Pushes are skipped on detached HEADs or when behind upstream, and
 repos with uncommitted changes (other than flake.lock and submodule
-pointers) block their own automation. Blockers are reported for you to
+pointers) block automation in that repo. Blockers are reported for you to
 resolve.
 EOF
 }
@@ -170,11 +170,11 @@ run() {
 #
 # Every repo (submodules + the workspace itself) is keyed by name.
 
-# The workspace root comes from the caller's cwd, not from this script's
-# own location: find the enclosing git repo, then walk up as long as the
+# The workspace root comes from the caller's cwd, not from the location of
+# this script: find the enclosing git repo, then walk up as long as the
 # current repo is registered as a submodule of an enclosing one, ending at
-# the parent-most superproject. A repo that is nobody's submodule is its
-# own root; a cwd outside any git repo is an error.
+# the parent-most superproject. A repo that is nobody's submodule is a
+# root by itself; a cwd outside any git repo is an error.
 find_root() {
   local top super
   top=$(git rev-parse --show-toplevel 2>/dev/null) \
@@ -532,10 +532,10 @@ build_plan() {
     if $WITH_TESTS; then
       local strays
       strays=$(stray_test_locks "$repo")
-      [ -n "$strays" ] && PLAN+=("WARN|test-locks|$repo|stray untracked lock(s): $(paste -sd, - <<<"$strays") — unlocked test flakes get their inputs via nix wiring, so a stray lock silently pins standalone runs; delete it (or track it to manage it)")
+      [ -n "$strays" ] && PLAN+=("WARN|test-locks|$repo|stray untracked lock(s): $(paste -sd, - <<<"$strays"); unlocked test flakes get their inputs via nix wiring, so a stray lock silently pins standalone runs; delete it (or track it to manage it)")
     fi
 
-    # Everything below plans commits and pushes — publication, which --local
+    # Everything below plans commits and pushes, that is publication, which --local
     # leaves entirely to CI convergence (or a full local converge).
     $LOCAL && continue
 
@@ -558,8 +558,8 @@ build_plan() {
         PLAN+=("READY|push|$repo|push ${AHEAD[$repo]} commit(s) on ${BRANCH[$repo]}")
       fi
     elif [ "${BEHIND[$repo]}" -gt 0 ]; then
-      # Nothing to push, so the branch above never fires — without this,
-      # a local checkout can drift arbitrarily far behind its own remote
+      # Nothing to push, so the branch above never fires. Without this,
+      # a local checkout can drift arbitrarily far behind its remote
       # (e.g. left on detached HEAD after `submodule update`) with no
       # actionable signal, only a color in `status`'s git column.
       if [ "${BRANCH[$repo]}" = "(detached)" ]; then
@@ -578,7 +578,7 @@ build_plan() {
 
 report_held() { # after a partial advance of $1: fail loudly about held-back pins ($2)
   [ -n "$2" ] || return 0
-  die "$1 advanced what it could; held back — $2"
+  die "$1 advanced what it could; held back: $2"
 }
 
 pin_override_args() { # print --override-input args (one per line) for pins of flake dir $2 in $1 whose target is in $3
@@ -620,7 +620,7 @@ trial_args() { # print override args for flake dir $3, given trial target set $2
 # trial loop: external pins have no sibling HEAD to pin to and no unpushed-
 # target concept, so they cannot be tried one-by-one in dependency order like
 # sibling targets. They are tried first, as one unit, so a failure holds back
-# only external pins and sibling targets still get their own trials on a
+# only external pins and sibling targets still get separate trials on a
 # clean base.
 EXT_PSEUDO_TARGET='__external__'
 
@@ -646,7 +646,7 @@ do_update_pins() {
   done <<<"$extlines"
   # Step-wise checking: try the stale pin targets cumulatively in dependency
   # order, greedily growing the advancing set. A target whose trial state
-  # fails `nix flake check` is held back alone — the order is only a
+  # fails `nix flake check` is held back alone, because the order is only a
   # linearization of the DAG, so an unrelated failure must not stop later
   # targets, and even a dependent of a held target may still advance (its
   # HEAD can be ahead of our pin regardless). The check arbitrates which
@@ -656,7 +656,7 @@ do_update_pins() {
   # External pins have no sibling HEAD and no unpushed-target concept, so
   # they're tried first as a single pseudo-target ($EXT_PSEUDO_TARGET): a
   # failure holds back only external pins and sibling targets still get
-  # their own trials on a clean base.
+  # separate trials on a clean base.
   local stale_targets=() t
   [ -n "$extlines" ] && stale_targets+=("$EXT_PSEUDO_TARGET")
   for t in "${TOPO[@]}"; do
@@ -713,7 +713,7 @@ do_update_pins() {
     held_report="fail nix flake check ($CHECK_MODE): ${held_labels[*]}"
   fi
   [ -n "$held_unpushed" ] && held_report+="${held_report:+; }target unpushed: $held_unpushed"
-  [ ${#advance[@]} -gt 0 ] || die "no pins advanced in $repo; held back — $held_report"
+  [ ${#advance[@]} -gt 0 ] || die "no pins advanced in $repo; held back: $held_report"
   local names=()
   while IFS=$'\t' read -r input t fd; do
     [ -n "$input" ] || continue
@@ -770,7 +770,7 @@ do_push() {
     git -C "$dir" fetch --quiet || true
     local behind
     behind=$(git -C "$dir" rev-list --count 'HEAD..@{u}' 2>/dev/null || echo "?")
-    die "push of $repo was rejected: the remote branch moved while we worked (now behind by $behind commit(s)). Rebase it yourself — e.g. git -C ${dir#"$ROOT"/} pull --rebase — then rerun."
+    die "push of $repo was rejected: the remote branch moved while we worked (now behind by $behind commit(s)). Rebase it yourself (for example git -C ${dir#"$ROOT"/} pull --rebase), then rerun."
   fi
   echo "${C_GRN}pushed $repo (${BRANCH[$repo]})${C_OFF}"
 }
@@ -871,9 +871,9 @@ cmd_status() {
   for entry in "${PLAN[@]}"; do
     IFS='|' read -r state action target detail <<<"$entry"
     case $state in
-      READY) echo "  ${C_GRN}ready${C_OFF}    $action $target — $detail" ;;
-      WARN) notes+=("  ${C_YLW}note${C_OFF}     $action $target — $detail") ;;
-      *) echo "  ${C_RED}blocked${C_OFF}  $action $target — $detail" ;;
+      READY) echo "  ${C_GRN}ready${C_OFF}    $action $target: $detail" ;;
+      WARN) notes+=("  ${C_YLW}note${C_OFF}     $action $target: $detail") ;;
+      *) echo "  ${C_RED}blocked${C_OFF}  $action $target: $detail" ;;
     esac
   done
   local n
@@ -904,7 +904,7 @@ cmd_next() {
   done
   if next=$(first_ready); then
     IFS='|' read -r action target detail <<<"$next"
-    echo "next: $action $target — $detail"
+    echo "next: $action $target: $detail"
   elif [ "$work" -eq 0 ]; then
     echo "${C_GRN}Converged: nothing to do.${C_OFF}"
   else
@@ -912,7 +912,7 @@ cmd_next() {
     for entry in "${PLAN[@]}"; do
       IFS='|' read -r state action target detail <<<"$entry"
       [ "$state" = WARN ] && continue
-      echo "  $action $target — $detail"
+      echo "  $action $target: $detail"
     done
     return 1
   fi
@@ -936,7 +936,7 @@ cmd_step() {
     return
   fi
   # Auto mode: run the first ready action, but a failure must not wedge the
-  # caller (e.g. a CI loop invoking `step` per iteration) — skip it and try
+  # caller (e.g. a CI loop invoking `step` per iteration): skip it and try
   # the remaining ready actions until one succeeds. Exit 0 iff a state
   # change was made.
   local next tgt failed=() attempts=0 repo
@@ -970,7 +970,7 @@ cmd_converge() {
     local next
     if ! next=$(first_ready); then break; fi
     IFS='|' read -r action target detail <<<"$next"
-    echo "${C_BLD}[step $((attempts + 1))] $action $target${C_OFF} — $detail"
+    echo "${C_BLD}[step $((attempts + 1))] $action $target${C_OFF}: $detail"
     # Subshell so a failing action (e.g. a push rejected because the remote
     # moved) reports and is skipped instead of killing the whole run.
     if (run_action "$action" "$target"); then
@@ -991,7 +991,7 @@ cmd_converge() {
   for entry in ${PLAN[@]+"${PLAN[@]}"}; do
     IFS='|' read -r state action target detail <<<"$entry"
     if [ "$state" = WARN ]; then
-      notes+=("  note: $action $target — $detail")
+      notes+=("  note: $action $target: $detail")
     else
       work=$((work + 1))
     fi
@@ -1009,11 +1009,11 @@ cmd_converge() {
     for entry in "${PLAN[@]}"; do
       IFS='|' read -r state action target detail <<<"$entry"
       [ "$state" = WARN ] && continue
-      echo "  $action $target — $detail"
+      echo "  $action $target: $detail"
     done
     local f n
     for f in ${failed[@]+"${failed[@]}"}; do
-      echo "  $f — failed this run (see message above)"
+      echo "  $f: failed this run (see message above)"
     done
     for n in ${notes[@]+"${notes[@]}"}; do echo "${C_YLW}$n${C_OFF}"; done
     return 1
@@ -1177,7 +1177,7 @@ cmd_pull() {
 cmd_check() {
   # Run every repo's `nix flake check` against its *current* locks: the same
   # gate update-pins applies to proposed pin states, but with no overrides
-  # and nothing written — a read-only "does the whole system still check"
+  # and nothing written: a read-only "does the whole system still check"
   # sweep. Failures don't stop the sweep; the summary names them and the
   # exit status reports whether everything passed.
   local target=""

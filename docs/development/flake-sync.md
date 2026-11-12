@@ -5,8 +5,8 @@ flakes that pin each other via `github:` (or `git+file:`/`git+ssh:`)
 inputs in their `flake.lock`s, while the workspace repo tracks each of
 them as a submodule. It discovers every submodule that is a flake, plus
 the workspace repo itself, and detects cross-repo pins by matching each
-`flake.lock`'s root-level inputs against submodule remote URLs — nothing
-is hardcoded, new submodules are picked up automatically. Root-level
+`flake.lock`'s root-level inputs against submodule remote URLs. Nothing
+is hardcoded, and new submodules are picked up automatically. Root-level
 inputs that resolve to a real locked node (not a `follows` alias) but
 don't match any sibling are "external" inputs, manageable with
 `--with-external` (below).
@@ -14,8 +14,9 @@ don't match any sibling are "external" inputs, manageable with
 Convergence means: every repo's pins point at the sibling's current local
 HEAD, every repo is pushed, and the workspace's submodule pointers match
 submodule HEADs. Pins only advance to *pushed* revs, which is what forces
-the dependency ordering: dep push → consumer re-pin + push → … → workspace
-pointer bumps + push. By default every pin advance is also validated first
+the dependency ordering: a dependency is pushed, then each consumer is
+re-pinned and pushed, and so on down the graph, until the workspace
+pointers are bumped and pushed. By default every pin advance is also validated first
 with an evaluation-only `nix flake check` of the proposed state
 (`--check=eval`); `--check=full` additionally builds the flake's checks,
 `--check=none` skips validation.
@@ -26,7 +27,7 @@ The workspace root is found from the current directory, never from the
 location of the executable: flake-sync takes the enclosing git repo and
 walks up as long as the current repo is registered as a submodule of an
 enclosing one, ending at the parent-most superproject. A repo that is
-nobody's submodule is its own workspace root (it still needs a
+nobody's submodule is a workspace root by itself (it still needs a
 `.gitmodules`, or there is nothing to converge). Running outside any git
 repo is an error. In particular, running from inside any submodule (a
 submodule of a submodule included) operates on the whole enclosing
@@ -52,8 +53,8 @@ flake-sync graph    # dependency DAG in topological order
 `git fetch` every repo first (slower, needs network).
 
 Add `--with-partitions` (or `--all`) to any command to also manage
-partition/dev input flakes — every *tracked* `flake.lock` below a repo's
-root (e.g. `tests/dependencies/`). Their pins show up labeled
+partition/dev input flakes, that is every *tracked* `flake.lock` below a
+repo's root (e.g. `tests/dependencies/`). Their pins show up labeled
 (`tests/dependencies:lib=stale`), join the DAG, and are advanced by the
 same `update-pins` step in one commit with the root lock. Dev pins can
 create edges the root DAG doesn't have; a true cycle is rejected with an
@@ -61,24 +62,24 @@ explanation since it has no convergent fixpoint.
 
 `--with-tests` (also in `--all`) covers always-unlocked test flakes (a
 tracked `flake.nix` with a gitignored lock): they get their inputs via nix
-wiring at eval time, so `--with-partitions` already keeps them current —
-the only mechanical hazard is a stray untracked `flake.lock` appearing
+wiring at eval time, so `--with-partitions` already keeps them current.
+The only mechanical hazard is a stray untracked `flake.lock` appearing
 there (it silently pins standalone runs to stale revs). Those are
 reported as informational notes; nothing is deleted and they don't block
 convergence.
 
 `--with-external` (also in `--all`) additionally manages root-level inputs
-that aren't sibling repos — `nixpkgs`, `home-manager`, and the like. These
+that aren't sibling repos, such as `nixpkgs` and `home-manager`. These
 show up in `status` labeled `ext:` (`ext:nixpkgs=stale`) and join
 `update-pins`' plan and commit alongside sibling pins. An external input
-is stale if `nix flake update <input>` would move its locked rev — this is
+is stale if `nix flake update <input>` would move its locked rev. This is
 checked by trial-locking into a scratch file, so it costs one `nix`
 invocation (network-bound) per external input per repo every time state is
 loaded. External pins have no sibling HEAD to pin to; the staleness trial
 lock resolves the rev an update would land on, and advancing re-locks with
-a fixed `--override-input` to exactly that rev, same as sibling pins — so
+a fixed `--override-input` to exactly that rev, as for sibling pins, so
 the check gate and the written lock see one and the same rev. They have no
-unpushed-target concept — they're simply stale or not.
+unpushed-target concept; they're simply stale or not.
 
 ## Advance one step
 
@@ -92,7 +93,7 @@ flake-sync step bump-submodules        # workspace pointer commit
 ```
 
 In the auto forms (`step`, `step <repo>`), a failing action is skipped and
-the remaining ready actions are tried until one succeeds — exit 0 means a
+the remaining ready actions are tried until one succeeds. Exit 0 means a
 state change was made, so a loop calling `step` per iteration can never
 wedge on one persistent failure. The explicit `step <action> <repo>` form
 runs exactly that action with no fallback.
@@ -109,7 +110,7 @@ flake-sync converge             # loop until converged or blocked
 ```
 
 `converge` exits 1 when blockers remain or some pins were held back
-(failing check, unpushed target) — that is a report, not a script failure.
+(failing check, unpushed target); that is a report, not a script failure.
 Resolve the listed blockers (commit dirty files, check out a branch, pull,
 fix the failing check) and rerun.
 
@@ -122,7 +123,7 @@ flake-sync pull
 The converse of `converge`: instead of publishing local state, bring this
 checkout to the published state. Remote convergence (e.g. a CI runner)
 routinely moves the remotes past a checkout (pin commits, pointer bumps),
-and plain git can only follow with `git pull` + `git submodule update` —
+and plain git can only follow with `git pull` + `git submodule update`,
 which strands every submodule on a detached HEAD, because to git a gitlink
 is only a pin. A converged workspace guarantees more: every recorded
 pointer is the pushed tip of its submodule's default branch, so `pull` can
@@ -134,8 +135,8 @@ check out the default branch and fast-forward it to the recorded pointer.
 Everything moves by fast-forward only, and the hold-backs mirror
 `converge`'s per-repo style: a submodule that is dirty (when files would
 have to move), whose default branch has diverged from the pointer, or
-that is parked on a topic branch is held and reported, never touched —
-exit 1 lists the holds while the rest still syncs. A default branch
+that is parked on a topic branch is held and reported, never touched.
+Exit 1 lists the holds while the rest still syncs. A default branch
 *ahead* of the pointer (unpushed local work) is attached and left alone,
 with a note. A pointer that doesn't match the submodule's
 `origin/<default>` also gets a note: remote convergence is likely
@@ -170,11 +171,11 @@ flake-sync converge --local --with-partitions
 ```
 
 `--local` advances stale pins in the working trees through the same check
-gate, and stops there: no commits, no pushes, no pointer bumps — those
-are publication. Two uses:
+gate, and stops there: it makes no commits, no pushes and no pointer
+bumps, because those are publication. Two uses:
 
 - **A check.** Exit 0 ("Locally converged") proves every pin can advance
-  to the pushed sibling tips past the gate — the pre-flight answer to
+  to the pushed sibling tips past the gate, the pre-flight answer to
   "will the ecosystem converge once this is pushed?". Exit 1 names what
   held and why.
 - **An accelerator.** The working trees are in the converged state
@@ -186,10 +187,10 @@ publishing commands refuse: dirty trees, detached HEADs, secondary
 checkouts and worktrees (it covers whatever submodules are initialized
 there). Pins still advance only to *pushed* sibling revs, so the locks it
 writes are byte-for-byte what publication will commit. Those dirty locks
-are previews: discard with `git checkout -- flake.lock` — do that before
+are previews. Discard them with `git checkout -- flake.lock` before
 pulling once the matching pin commit lands remotely, since even an
-identical uncommitted lock blocks a pull — or keep building on them until
-then. To build against *unpushed* sibling changes, stay with transient
+identical uncommitted lock blocks a pull; until then, building on them
+is fine. To build against *unpushed* sibling changes, stay with transient
 overrides (`--override-input <dep> path:../<dep>`); `--local` never
 writes an unpushed rev into a lock.
 
@@ -209,8 +210,8 @@ flake-sync --with-partitions check   # include partition/dev flakes
 
 `check` runs the same `nix flake check --no-write-lock-file` gate that
 `update-pins` applies to proposed pin states, but against every repo's
-*current* locks, with no overrides and nothing written — fully read-only
-(no re-pins, commits, or pushes). Depth follows `--check` exactly as for
+*current* locks, with no overrides and nothing written. It is fully
+read-only (no re-pins, commits, or pushes). Depth follows `--check` exactly as for
 the gate: `eval` (the default) adds `--no-build`, `full` builds the checks,
 and `none` is rejected since it would check nothing. A failing repo doesn't
 stop the sweep; each flake reports `check passed`/`check FAILED`, the
@@ -222,16 +223,16 @@ landing changes that didn't go through the gate.
 
 - **Detached HEADs block everything mutating.** Submodules checked out by
   `git submodule update` are detached, and `update-pins`/`push` refuse to
-  run there — otherwise the commits would strand. Check out the real
+  run there, because the commits would strand. Check out the real
   branch first: `git -C <submodule-path> checkout main` (verify main
   matches the recorded pointer before doing this in a checkout you don't
   own).
-- **Pins advance only to pushed revs, and only past the check gate — but a
+- **Pins advance only to pushed revs, and only past the check gate, but a
   pin that can't advance holds back only itself.** Stale targets are tried
   cumulatively in dependency order; one that fails the check (or whose rev
   is unpushed) is held individually while sibling pins still advance in a
   partial commit that gets pushed, so progress flows around the failure.
-  The action then exits nonzero and reports what was held — rerunning after
+  The action then exits nonzero and reports what was held; rerunning after
   the cause is fixed picks the rest up. `holding pins to unpushed` entries
   resolve themselves during `converge` (the dep gets pushed first). Pins
   move to the target's HEAD or not at all: the objective is fewer stale
@@ -266,19 +267,19 @@ landing changes that didn't go through the gate.
   refreshed, and `converge` continues with whatever independent work
   remains before exiting 1.
 - **Pinning uses `nix flake lock --override-input <name>
-  github:owner/repo/<exact-rev>`**, never `nix flake update` — so it needs
+  github:owner/repo/<exact-rev>`**, never `nix flake update`, so it needs
   network access to the forge, but is immune to GitHub tarball-TTL cache
   staleness right after a push, and works when a dep sits on a non-default
   branch. Re-pinning one input also refreshes its transitive subtree in the
-  lock (expected; that's nix re-locking the dep's own inputs).
+  lock (expected; that's nix re-locking the inputs of the dep).
 - Auto-commits use a `maint:` message convention and commit via
   pathspec, so anything else you have staged is left alone.
 - **External pins (`--with-external`) are tried as one unit, before any
   sibling target.** All of a repo's stale external inputs are checked
   together as a single step; if that step fails `nix flake check`, only the
   external pins are held back (reported as `external pins` in the held-back
-  message) and every sibling pin still gets its own trial on a clean base.
-  There is no per-external-input isolation — one bad external input holds
+  message) and every sibling pin still gets a separate trial on a clean base.
+  There is no per-external-input isolation: one bad external input holds
   back all of that repo's external inputs together.
 
 ## Test harness
@@ -303,7 +304,7 @@ nix build '.#checks.x86_64-linux.vm-lifecycle' -L --no-link
 ```
 
 The fixture only works because the script supports git/file remotes in
-addition to `github:` ones — pins for non-github submodule remotes are
+addition to `github:` ones; pins for non-github submodule remotes are
 advanced with `git+file://…?rev=…&ref=…` overrides.
 
 Building the package itself (`nix build`, or the `package` check) also

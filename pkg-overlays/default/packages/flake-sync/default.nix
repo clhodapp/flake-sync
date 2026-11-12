@@ -28,7 +28,7 @@ writeShellApplication {
     nix
   ];
 
-  # writeShellApplication supplies its own shebang (and shellchecks the
+  # writeShellApplication supplies a shebang (and shellchecks the
   # result at build time); the file keeps one so it also runs directly
   # from a checkout during development.
   text = lib.removePrefix "#!/usr/bin/env bash\n" (builtins.readFile ./flake-sync);

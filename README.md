@@ -47,11 +47,11 @@ version:
 
 `nix profile install github:clhodapp/flake-sync` puts it on `PATH`
 permanently. It needs `git` and `nix` at runtime, both of which the
-package carries in its own closure.
+package carries in its closure.
 
 The workspace is found from the current directory: the enclosing git
 repo, walked up to the parent-most repo that tracks it as a submodule. A
-repo that is nobody's submodule is its own workspace; running outside
+repo that is nobody's submodule is a workspace by itself; running outside
 any git repo is an error.
 
 Pins only advance to pushed revs (which is what forces the DAG
@@ -75,9 +75,10 @@ convergence lifecycle against a fake GitHub of local bare repos;
 
 In CI the same `nix flake check` runs with the Nix store cached between
 runs. A pull request that leaves `.github/` alone is checked by `main`'s
-copy of the workflow, in `main`'s context once its own check completes,
-and adds its build to the shared cache; one that changes the pipeline is
-checked by its own copy, under a cache only it can see. The comments at
+copy of the workflow, in `main`'s context once the request's check-pr
+run completes, and adds its build to the shared cache; a pull request
+that changes the pipeline is checked by the copy of the workflow it
+carries, under a cache only that request can see. The comments at
 the top of the two workflow files say why that split is what makes the
 cache safe to write from a pull request.
 

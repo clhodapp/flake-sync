@@ -77,7 +77,7 @@ git -C projects/app log -1 --format=%s | grep -q '^maint: update flake pins (lib
 echo "ok: pin commit message"
 assert_converged "converge reaches converged state"
 
-echo "=== 5. dirty consumer blocks its own re-pin; the rest proceeds"
+echo "=== 5. dirty consumer blocks the re-pin of that consumer; the rest proceeds"
 echo dirt >>projects/app/README.md
 echo change2 >>projects/lib/feature.txt
 git -C projects/lib commit -aqm "feat: change lib again"
@@ -371,7 +371,7 @@ expect_contains "$out" "Locally converged" "local converge reports local converg
 [ "$(lock_rev projects/machines lib)" = "$(head_rev projects/lib)" ] \
   || fail "local mode should advance machines' lib pin despite the detached HEAD"
 [ "$(lock_rev . lib)" = "$(head_rev projects/lib)" ] \
-  || fail "local mode should advance the workspace's own lock"
+  || fail "local mode should advance the lock of the workspace repo"
 [ "$before_heads" = "$(head_rev projects/app; head_rev projects/machines; head_rev .)" ] \
   || fail "local mode must not create commits"
 [ "$before_hub" = "$(hub_rev lib; hub_rev app; hub_rev machines; hub_rev workspace)" ] \
@@ -402,7 +402,7 @@ echo "=== 16. a drv-closure check is held by the eval gate until it is rewritten
 # --no-build eval never wrote them, so the check fails with "is not
 # valid" and the gate holds the pin (NixOS/nix#15448; the workspace
 # keeps its flakes free of the pattern, see known-issues.md). Embedding
-# the flake's own source path makes the inner derivation unique per
+# the source path of the flake makes the inner derivation unique per
 # fixture run, so a warm host store cannot mask the failure.
 cat >projects/app/flake.nix <<EOF
 {
@@ -566,14 +566,14 @@ expect_contains "$out" "machines" "a submodule cwd resolves to the enclosing wor
 git -C "$scratch/projects/lib" submodule -q add "file://$HUB/extdep.git" vendor/extdep
 out=$(cd "$scratch/projects/lib/vendor/extdep" && "$FS" status)
 expect_contains "$out" "machines" "a nested submodule cwd resolves to the parent-most workspace"
-# A repo that is nobody's submodule is its own root (here one without
+# A repo that is nobody's submodule is a root by itself (here a repo without
 # submodules, so the .gitmodules requirement names that repo itself).
 plain=$(mktemp -d)/plain
 git clone -q "file://$HUB/lib.git" "$plain"
 plain_root=$(git -C "$plain" rev-parse --show-toplevel)
 rc=0; out=$(cd "$plain" && "$FS" status 2>&1) || rc=$?
-[ "$rc" -ne 0 ] || fail "a repo without submodules should be rejected as its own root"
-expect_contains "$out" "$plain_root has no .gitmodules" "a repo that is nobody's submodule is its own root"
+[ "$rc" -ne 0 ] || fail "a repo without submodules should be rejected as a root"
+expect_contains "$out" "$plain_root has no .gitmodules" "a repo that is nobody's submodule is a root by itself"
 # Outside any git repo, flake-sync fails with a clear message. The
 # ceiling keeps git from walking above the scratch dir, so the scenario
 # holds even when TMPDIR itself sits inside some checkout.
