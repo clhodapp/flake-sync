@@ -4,7 +4,6 @@
   config,
   inputs,
   lib,
-  self,
   ...
 }:
 {
@@ -33,7 +32,17 @@
       packages.default = config.packages.flake-sync;
     };
 
-  partitionedAttrs.checks = "checks";
+  # The checks of flake-sync, with the pins of tests/dependencies that
+  # only the checks need (configs/flake/checks). The caisson top gathers
+  # the checks of every configuration declared inside it into its
+  # `checks` output. This selector passes the configuration up to
+  # nothing, so a flake that reads the exports of flake-sync evaluates
+  # neither the configuration nor its pins.
+  caisson.flake-parts.configurations.checks = lib.caisson.flake-parts.mkConfiguration {
+    inherit (lib.caisson.pins.flake-compat ../../../tests/dependencies) dependencies;
+  };
+  caisson.flake-parts.exported = _: { };
+
   partitionedAttrs.formatter = "formatter";
 
   partitions.formatter = {
@@ -43,30 +52,6 @@
       {
         imports = [ inputs.treefmt-nix.flakeModule ];
         perSystem.treefmt.programs.nixfmt.enable = true;
-      };
-  };
-
-  partitions.checks = {
-    extraInputs = (lib.caisson.pins.flake-compat ../../../tests/dependencies).dependencies;
-    module =
-      { inputs, self, ... }:
-      {
-        imports = [ inputs.treefmt-nix.flakeModule ];
-        perSystem =
-          { pkgs, system, ... }:
-          {
-            checks = {
-              # Building the package proves its declared runtime closure
-              # is complete and shellchecks the script.
-              package = self.packages.${system}.flake-sync;
-              # Full offline lifecycle test against a fake GitHub of
-              # local bare repos, driving the packaged executable.
-              vm-lifecycle = import ../../../tests/vm {
-                inherit pkgs;
-                flake-sync = self.packages.${system}.flake-sync;
-              };
-            };
-          };
       };
   };
 

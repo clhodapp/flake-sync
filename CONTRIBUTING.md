@@ -27,9 +27,9 @@ runs the VM lifecycle test. The VM test takes a while; to iterate faster,
 build the pieces separately:
 
 ```sh
-nix build '.#checks.x86_64-linux.package'      # build + shellcheck
-nix build '.#checks.x86_64-linux.treefmt'      # formatting
-nix build '.#checks.x86_64-linux.vm-lifecycle' # the lifecycle test
+nix build '.#checks.x86_64-linux.flake-sync-package' # build + shellcheck
+nix build '.#checks.x86_64-linux.treefmt'            # formatting
+nix build '.#checks.x86_64-linux.vm-lifecycle'       # the lifecycle test
 ```
 
 `nix fmt` formats the Nix files.
