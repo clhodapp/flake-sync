@@ -56,7 +56,7 @@ echo "ok: hub lib.git is at lib HEAD"
 out=$($FS next)
 expect_contains "$out" "update-pins app" "next action re-pins app"
 
-echo "=== 3b. override prints a flake ref with the overrides that move its stale workspace inputs to the hub heads, read-only"
+echo "=== 3b. override-inputs prints a flake ref with the overrides that move its stale workspace inputs to the hub heads, read-only"
 state_of_repos() { # HEADs, hub refs, and porcelain status of every repo
   local r
   for r in lib app machines; do head_rev "projects/$r"; done
@@ -69,24 +69,24 @@ before=$(state_of_repos)
 machines_ref="git+file://$HUB/machines.git"
 lib_tip=$(hub_rev lib)
 flags="--override-input app/lib git+file://$HUB/lib.git?rev=$lib_tip --override-input lib git+file://$HUB/lib.git?rev=$lib_tip"
-out=$($FS override "$machines_ref")
-[ "$out" = "$machines_ref $flags" ] || { printf 'output was:\n%s\n' "$out" >&2; fail "override prints the ref, then lib and app/lib, and nothing else"; }
-echo "ok: override names the stale lib inputs, not the current app or the external extdep"
-out=$($FS override "$machines_ref#host")
-[ "$out" = "$machines_ref#host $flags" ] || { printf 'output was:\n%s\n' "$out" >&2; fail "override keeps the #attr on the ref"; }
-echo "ok: override keeps the #attr and looks up the flake without it"
-[ "$before" = "$(state_of_repos)" ] || fail "override must not change any repo state"
-echo "ok: override is read-only"
+out=$($FS override-inputs "$machines_ref")
+[ "$out" = "$machines_ref $flags" ] || { printf 'output was:\n%s\n' "$out" >&2; fail "override-inputs prints the ref, then lib and app/lib, and nothing else"; }
+echo "ok: override-inputs names the stale lib inputs, not the current app or the external extdep"
+out=$($FS override-inputs "$machines_ref#host")
+[ "$out" = "$machines_ref#host $flags" ] || { printf 'output was:\n%s\n' "$out" >&2; fail "override-inputs keeps the #attr on the ref"; }
+echo "ok: override-inputs keeps the #attr and looks up the flake without it"
+[ "$before" = "$(state_of_repos)" ] || fail "override-inputs must not change any repo state"
+echo "ok: override-inputs is read-only"
 # The output is meant to be split into words.
 # shellcheck disable=SC2046
-resolved=$(nix flake metadata --json $($FS override "$machines_ref") | jq -r '.locks as $L | $L.nodes[$L.nodes[$L.root].inputs.lib].locked.rev')
+resolved=$(nix flake metadata --json $($FS override-inputs "$machines_ref") | jq -r '.locks as $L | $L.nodes[$L.nodes[$L.root].inputs.lib].locked.rev')
 [ "$resolved" = "$lib_tip" ] || fail "the output does not move lib to the hub head ($resolved)"
 echo "ok: the output, passed in place of a flake ref, resolves lib to the hub head"
 
-echo "=== 3c. override encodes a local flake ref with a space"
+echo "=== 3c. override-inputs encodes a local flake ref with a space"
 spaced="$(dirname "$WORK")/machines copy"
 git clone -q "file://$HUB/machines.git" "$spaced"
-out=$($FS override "$spaced")
+out=$($FS override-inputs "$spaced")
 ref=${out%% *}
 case $ref in
   git+file://*%20copy) ;;
@@ -94,7 +94,7 @@ case $ref in
 esac
 [ "${out#* }" = "$flags" ] || { printf 'output was:\n%s\n' "$out" >&2; fail "the encoded ref keeps its overrides"; }
 # shellcheck disable=SC2046
-resolved=$(nix flake metadata --json $($FS override "$spaced") | jq -r '.locks as $L | $L.nodes[$L.nodes[$L.root].inputs.lib].locked.rev')
+resolved=$(nix flake metadata --json $($FS override-inputs "$spaced") | jq -r '.locks as $L | $L.nodes[$L.nodes[$L.root].inputs.lib].locked.rev')
 [ "$resolved" = "$lib_tip" ] || fail "the encoded output does not resolve ($resolved)"
 echo "ok: a local ref with a space is printed encoded and resolves"
 rm -rf "$spaced"

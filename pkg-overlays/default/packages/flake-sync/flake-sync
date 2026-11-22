@@ -72,15 +72,15 @@ Commands:
               full builds the checks); --with-partitions also checks
               partition/dev input flakes
   graph       Print the dependency DAG in topological order
-  override <flake-ref>
+  override-inputs <flake-ref>
               Print <flake-ref>, then an `--override-input` flag for every
               input in its lock, at any depth, that pins a workspace repo
               at a commit other than the head of that repo's remote,
               moving it to that head. External inputs are left out. It
               reads .gitmodules, the flake and the remotes and changes
               nothing. Its output takes the place of a flake reference:
-              `nixos-rebuild switch --flake $(flake-sync override .)`,
-              `nix build $(flake-sync override '.#pkg')`
+              `nixos-rebuild switch --flake $(flake-sync override-inputs .)`,
+              `nix build $(flake-sync override-inputs '.#pkg')`
 
 Step forms:
   step                          run the next ready action; if it fails, try
@@ -1232,8 +1232,8 @@ cmd_check() {
   fi
 }
 
-cmd_override() { # print flake ref $1 and the --override-input flags that move its workspace inputs to their remotes' heads
-  [ "$#" -eq 1 ] || die "usage: flake-sync override <flake-ref>"
+cmd_override_inputs() { # print flake ref $1 and the --override-input flags that move its workspace inputs to their remotes' heads
+  [ "$#" -eq 1 ] || die "usage: flake-sync override-inputs <flake-ref>"
   local ref=$1 flake attr="" key path url slug
   flake=${ref%%#*}
   [ "$flake" = "$ref" ] || attr="#${ref#*#}"
@@ -1335,10 +1335,10 @@ command -v jq >/dev/null || die "jq is required"
 [ "$CMD" != pull ] || DO_FETCH=true
 [ "$CMD" = pull ] || ! $HEADS || die "--heads applies to pull only"
 
-# override reads only .gitmodules, the flake and the remotes, so it needs
+# override-inputs reads only .gitmodules, the flake and the remotes, so it needs
 # none of the working-tree state.
-if [ "$CMD" = override ]; then
-  cmd_override "${ARGS[@]}"
+if [ "$CMD" = override-inputs ]; then
+  cmd_override_inputs "${ARGS[@]}"
   exit 0
 fi
 

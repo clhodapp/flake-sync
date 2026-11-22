@@ -219,15 +219,15 @@ summary names the failures, and the exit status is nonzero if any failed.
 Use it to find out where the system stands before a converge, or after
 landing changes that didn't go through the gate.
 
-## Use pushed changes before they are re-pinned: override
+## Use pushed changes before they are re-pinned: override-inputs
 
 ```sh
-nixos-rebuild switch --sudo --flake $(flake-sync override .)
-home-manager switch --flake $(flake-sync override '.#chris@chris-desktop-2')
-nix build $(flake-sync override '.#pkg')
+nixos-rebuild switch --sudo --flake $(flake-sync override-inputs .)
+home-manager switch --flake $(flake-sync override-inputs '.#chris@chris-desktop-2')
+nix build $(flake-sync override-inputs '.#pkg')
 ```
 
-`override <flake-ref>` prints `<flake-ref>` and then one
+`override-inputs <flake-ref>` prints `<flake-ref>` and then one
 `--override-input <path> <ref>` pair for every input in its lock that
 pins a workspace repo at a commit other than the head of that repo's
 remote. `<ref>` names that head. The output takes the place of a flake
@@ -252,7 +252,17 @@ the overridden inputs together before they are printed.
 
 `nixos-rebuild`, `darwin-rebuild`, `home-manager` and the nix CLI accept
 the output. `system-manager` and `colmena` accept no input overrides in any
-form, so `override` cannot help them.
+form, so `override-inputs` cannot help them.
+
+When `override-inputs` fails, the shell substitutes nothing and still runs
+the command, so `--flake $(flake-sync override-inputs <ref>)` becomes a
+bare `--flake`. `nixos-rebuild` then evaluates the flake of the current
+directory. Its error names that flake, as in `flake
+'git+file:///home/chris/Projects/ch-nix-workspace' does not provide
+attribute 'nixosConfigurations."chris-desktop-2"'`. To stop on a failure,
+run the substitution first, as in
+`args=$(flake-sync override-inputs <ref>) && nixos-rebuild switch --flake ${=args}`
+in zsh.
 
 ## Gotchas
 
