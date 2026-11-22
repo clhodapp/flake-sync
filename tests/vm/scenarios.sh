@@ -668,4 +668,47 @@ rc=0; out=$(cd "$nowhere" && GIT_CEILING_DIRECTORIES=$nowhere "$FS" status 2>&1)
 expect_contains "$out" "not inside a git repository" "non-repo cwd fails with a clear message"
 echo "ok: root discovery follows the cwd"
 
+echo "=== 20. --fetch refreshes the default and checked-out branches, and falls back to a full fetch"
+elsewhere=$(mktemp -d)
+git clone -q "file://$HUB/machines.git" "$elsewhere/machines"
+git clone -q "file://$HUB/app.git" "$elsewhere/app"
+# A commit pushed elsewhere to machines' default branch.
+echo default >"$elsewhere/machines/default.txt"
+git -C "$elsewhere/machines" add default.txt
+git -C "$elsewhere/machines" commit -qm "feat: on main elsewhere"
+git -C "$elsewhere/machines" push -q origin main
+# app checked out on a topic branch, which then moves elsewhere.
+git -C "$elsewhere/app" push -q origin main:topic
+git -C projects/app fetch -q origin topic:refs/remotes/origin/topic
+git -C projects/app checkout -q -b topic --track origin/topic
+echo topic >"$elsewhere/app/topic.txt"
+git -C "$elsewhere/app" add topic.txt
+git -C "$elsewhere/app" commit -qm "feat: on topic elsewhere"
+git -C "$elsewhere/app" push -q origin HEAD:topic
+# A commit of the lib checkout that reaches the hub only on a branch the
+# checkout does not track: git records the push as origin/side, so the
+# ref is deleted again to stand for a branch pushed from elsewhere.
+echo side >projects/lib/side.txt
+git -C projects/lib add side.txt
+git -C projects/lib commit -qm "feat: only on side"
+git -C projects/lib push -q origin HEAD:refs/heads/side
+git -C projects/lib update-ref -d refs/remotes/origin/side
+[ -z "$(git -C projects/lib for-each-ref --contains HEAD refs/remotes)" ] || fail "the side commit should be on no remote-tracking ref yet"
+$FS --fetch status >/dev/null 2>&1 || true
+[ "$(git -C projects/machines rev-parse origin/main)" = "$(hub_rev machines)" ] \
+  || fail "the default branch was not refreshed"
+echo "ok: --fetch refreshes the default branch"
+[ "$(git -C projects/app rev-parse origin/topic)" = "$(git --git-dir="$HUB/app.git" rev-parse topic)" ] \
+  || fail "the checked-out topic branch's upstream was not refreshed"
+echo "ok: --fetch refreshes the upstream of a checked-out topic branch"
+[ "$(git -C projects/lib rev-parse origin/side 2>/dev/null)" = "$(head_rev projects/lib)" ] \
+  || fail "a commit only on an untracked remote branch needs the full-fetch fallback"
+echo "ok: a HEAD on no fetched ref falls back to a full fetch"
+# Moving machines' remote makes its fetch fail.
+git -C projects/machines remote set-url origin "file://$HUB/missing.git"
+out=$($FS --fetch status 2>&1 || true)
+git -C projects/machines remote set-url origin "file://$HUB/machines.git"
+expect_contains "$out" "fetch failed for machines" "a failed fetch is still reported"
+git -C projects/app checkout -q main
+
 echo "ALL SCENARIOS PASSED"

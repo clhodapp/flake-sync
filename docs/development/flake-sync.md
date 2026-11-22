@@ -50,7 +50,13 @@ flake-sync graph    # dependency DAG in topological order
 ```
 
 `status` compares against local remote-tracking refs; add `--fetch` to
-`git fetch` every repo first (slower, needs network).
+fetch every repo first (slower, needs network). `pull` always fetches.
+The fetches run 8 at a time. Each repo fetches its default branch, named
+by its local `refs/remotes/<remote>/HEAD`, and the upstream of the branch
+it has checked out, without tags. When its `HEAD` is then on no
+remote-tracking ref, or the default branch is not known, the repo fetches
+everything instead, because `HEAD` may have been pushed to a branch that
+is not checked out, and pushed-ness counts any remote ref.
 
 Add `--with-partitions` (or `--all`) to any command to also manage
 partition/dev input flakes, that is every *tracked* `flake.lock` below a

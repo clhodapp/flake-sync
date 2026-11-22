@@ -108,7 +108,10 @@ Options:
                         whatever passes advances in one commit. The same
                         mode picks the depth of the `check` command (none
                         is rejected there)
-      --fetch           git fetch every repo before assessing state
+      --fetch           Fetch every repo before assessing state, 8 at a time:
+                        its default branch and its checked-out branch's
+                        upstream, or everything when HEAD is then on no
+                        remote-tracking ref
       --heads           (pull only) Sync each submodule to origin/<default>
                         rather than to the pointer the workspace records.
                         The pointers lag the remotes until convergence
@@ -471,14 +474,49 @@ refresh_state() { # re-read git/pin state for every repo (after a mutating actio
   read_pointer_state
 }
 
+FETCH_JOBS=8
+
+fetch_repo() { # refresh repo $1's remote-tracking refs as far as flake-sync reads them
+  local repo=$1 dir=${DIR[$1]} remote=origin default="" branch upstream refspecs=()
+  # The checked-out branch's upstream remote, if it has one, else origin.
+  branch=$(git -C "$dir" symbolic-ref --short -q HEAD || true)
+  upstream=""
+  if [ -n "$branch" ]; then
+    upstream=$(git -C "$dir" rev-parse --abbrev-ref --symbolic-full-name '@{u}' 2>/dev/null || true)
+    [ -z "$upstream" ] || remote=${upstream%%/*}
+  fi
+  default=$(git -C "$dir" symbolic-ref --short -q "refs/remotes/$remote/HEAD" || true)
+  default=${default#"$remote"/}
+  # The default branch, plus the checked-out branch's upstream: the refs
+  # pull, status and converge read for a repo checked out as usual.
+  if [ -n "$default" ]; then
+    refspecs+=("+refs/heads/$default:refs/remotes/$remote/$default")
+    if [ -n "$upstream" ] && [ "${upstream#"$remote"/}" != "$default" ]; then
+      refspecs+=("+refs/heads/${upstream#"$remote"/}:refs/remotes/$upstream")
+    fi
+  fi
+  if [ ${#refspecs[@]} -gt 0 ] \
+    && git -C "$dir" fetch --quiet --no-tags "$remote" "${refspecs[@]}" 2>/dev/null \
+    && { [ -z "$(git -C "$dir" for-each-ref --count=1 --format=x refs/remotes)" ] \
+         || [ -n "$(git -C "$dir" for-each-ref --count=1 --format=x --contains HEAD refs/remotes)" ]; }; then
+    return 0
+  fi
+  # The narrow fetch could not run, or HEAD is on no remote-tracking ref:
+  # HEAD may sit on a remote branch that is not checked out, which only a
+  # full fetch reveals before is_pushed judges it.
+  git -C "$dir" fetch --quiet || echo "${C_YLW}warning: fetch failed for $repo${C_OFF}" >&2
+}
+
 load_state() {
   discover_repos
   local repo
   if $DO_FETCH; then
+    echo "fetching ${#DIR[@]} repos..." >&2
     for repo in "${!DIR[@]}"; do
-      echo "fetching $repo..." >&2
-      git -C "${DIR[$repo]}" fetch --quiet || echo "${C_YLW}warning: fetch failed for $repo${C_OFF}" >&2
+      while [ "$(jobs -rp | wc -l)" -ge "$FETCH_JOBS" ]; do wait -n || true; done
+      fetch_repo "$repo" &
     done
+    wait || true
   fi
   refresh_state
   toposort
