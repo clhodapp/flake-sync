@@ -80,7 +80,11 @@ Commands:
               reads .gitmodules, the flake and the remotes and changes
               nothing. Its output takes the place of a flake reference:
               `nixos-rebuild switch --flake $(flake-sync override-inputs .)`,
-              `nix build $(flake-sync override-inputs '.#pkg')`
+              `nix build $(flake-sync override-inputs '.#pkg')`.
+              With --local, an input whose repo is an initialized
+              submodule of this checkout moves to that submodule's HEAD
+              instead, unpushed commits included; uncommitted changes are
+              left out, with a warning
 
 Step forms:
   step                          run the next ready action; if it fails, try
@@ -1239,11 +1243,16 @@ cmd_override_inputs() { # print flake ref $1 and the --override-input flags that
   [ "$flake" = "$ref" ] || attr="#${ref#*#}"
   # Workspace repos come from .gitmodules, so an uninitialized submodule
   # counts too: owner/repo for a GitHub remote, else the normalized URL.
-  declare -A remote=()
+  # With --local, an initialized submodule of this checkout stands in for
+  # its remote.
+  declare -A remote=() checkout=()
+  local k
   while read -r key path; do
     url=$(git config -f "$ROOT/.gitmodules" "${key%.path}.url")
     slug=$(gh_slug "$url")
-    if [ -n "$slug" ]; then remote[gh:$slug]=$url; else remote[git:$(norm_url "$url")]=$url; fi
+    if [ -n "$slug" ]; then k=gh:$slug; else k=git:$(norm_url "$url"); fi
+    remote[$k]=$url
+    if $LOCAL && [ -e "$ROOT/$path/.git" ]; then checkout[$k]=$ROOT/$path; fi
   done < <(git config -f "$ROOT/.gitmodules" --get-regexp '^submodule\..*\.path$')
 
   local meta
@@ -1272,7 +1281,7 @@ cmd_override_inputs() { # print flake ref $1 and the --override-input flags that
       inputs_of($L.root; [])' <<<"$meta")
 
   declare -A tip=()
-  local input kind id rev k target
+  local input kind id rev target dir
   while IFS=$'\t' read -r input kind id rev; do
     [ -n "$input" ] || continue
     case $kind in
@@ -1280,15 +1289,27 @@ cmd_override_inputs() { # print flake ref $1 and the --override-input flags that
       git) k=git:$(norm_url "$id") ;;
     esac
     [ -n "${remote[$k]:-}" ] || continue
+    dir=${checkout[$k]:-}
     if [ -z "${tip[$k]:-}" ]; then
-      tip[$k]=$(git ls-remote "${remote[$k]}" HEAD | cut -f1) || die "cannot read the head of ${remote[$k]}"
-      [ -n "${tip[$k]}" ] || die "${remote[$k]} has no HEAD"
+      if [ -n "$dir" ]; then
+        tip[$k]=$(git -C "$dir" rev-parse HEAD) || die "cannot read the HEAD of $dir"
+        # Stderr, so a substitution carries only the arguments.
+        [ -z "$(git -C "$dir" status --porcelain)" ] \
+          || echo "${C_YLW}warning: $dir has uncommitted changes; pinning its HEAD without them${C_OFF}" >&2
+      else
+        tip[$k]=$(git ls-remote "${remote[$k]}" HEAD | cut -f1) || die "cannot read the head of ${remote[$k]}"
+        [ -n "${tip[$k]}" ] || die "${remote[$k]} has no HEAD"
+      fi
     fi
     [ "${tip[$k]}" != "$rev" ] || continue
-    case $kind in
-      gh) target="github:$id/${tip[$k]}" ;;
-      git) target="git+${id// /%20}?rev=${tip[$k]}" ;;
-    esac
+    if [ -n "$dir" ]; then
+      target="git+file://${dir// /%20}?rev=${tip[$k]}"
+    else
+      case $kind in
+        gh) target="github:$id/${tip[$k]}" ;;
+        git) target="git+${id// /%20}?rev=${tip[$k]}" ;;
+      esac
+    fi
     out+=(--override-input "$input" "$target")
   done <<<"$nodes"
   printf '%s\n' "${out[*]}"

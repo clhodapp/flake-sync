@@ -237,6 +237,18 @@ printed reference and is ignored for the lookup. A local reference with a
 space in it is printed as the URL Nix resolves it to, with the space
 percent-encoded, so every word of the output is free of whitespace.
 
+With `--local`, an input whose repo is an initialized submodule of the
+checkout you run it in moves to that submodule's `HEAD` instead, as
+`git+file://<path>?rev=<HEAD>`, so a build can use commits that are not
+pushed yet. Uncommitted changes are not part of `HEAD`, so they are left
+out, and a submodule that has any gets a warning on stderr, which a
+substitution does not capture. An input whose repo has no initialized
+submodule here moves to the head of the repo's remote.
+
+```sh
+nixos-rebuild build --flake $(flake-sync --local override-inputs ./projects/ch-personal-machines)
+```
+
 The walk covers inputs at any depth that are not `follows`, so a repo that
 reaches the flake only through another input gets a nested path such as
 `app/lib`. External inputs, such as nixpkgs, are left out, as with

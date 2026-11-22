@@ -99,6 +99,28 @@ resolved=$(nix flake metadata --json $($FS override-inputs "$spaced") | jq -r '.
 echo "ok: a local ref with a space is printed encoded and resolves"
 rm -rf "$spaced"
 
+echo "=== 3d. override-inputs --local moves inputs to the HEADs of this checkout's submodules"
+echo local >projects/lib/local.txt
+git -C projects/lib add local.txt
+git -C projects/lib commit -qm "feat: an unpushed change"
+local_rev=$(head_rev projects/lib)
+local_flags="--override-input app/lib git+file://$WORK/projects/lib?rev=$local_rev --override-input lib git+file://$WORK/projects/lib?rev=$local_rev"
+out=$($FS --local override-inputs "$machines_ref" 2>"$HUB.err")
+[ "$out" = "$machines_ref $local_flags" ] || { printf 'output was:\n%s\n' "$out" >&2; fail "--local moves lib and app/lib to the submodule HEAD"; }
+[ ! -s "$HUB.err" ] || { cat "$HUB.err" >&2; fail "a clean submodule needs no warning"; }
+echo "ok: --local names the unpushed lib HEAD of the checkout"
+# shellcheck disable=SC2046
+resolved=$(nix flake metadata --json $($FS --local override-inputs "$machines_ref") | jq -r '.locks as $L | $L.nodes[$L.nodes[$L.root].inputs.lib].locked.rev')
+[ "$resolved" = "$local_rev" ] || fail "the --local output does not resolve lib to the submodule HEAD ($resolved)"
+echo "ok: the --local output resolves lib to the submodule HEAD"
+echo edited >>projects/lib/README.md
+out=$($FS --local override-inputs "$machines_ref" 2>"$HUB.err")
+[ "$out" = "$machines_ref $local_flags" ] || fail "uncommitted changes do not change the pinned HEAD"
+expect_contains "$(cat "$HUB.err")" "uncommitted changes" "a dirty submodule is warned about on stderr"
+git -C projects/lib checkout -q -- README.md
+git -C projects/lib reset -q --hard HEAD~1
+[ "$before" = "$(state_of_repos)" ] || fail "3d did not restore the repos"
+
 echo "=== 4. converge finishes everything in DAG order"
 $FS converge
 for consumer in app machines; do
