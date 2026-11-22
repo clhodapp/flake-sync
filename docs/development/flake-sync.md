@@ -276,6 +276,21 @@ run the substitution first, as in
 `args=$(flake-sync override-inputs <ref>) && nixos-rebuild switch --flake ${=args}`
 in zsh.
 
+## Run the newest flake-sync: --latest-flake-sync
+
+```sh
+flake-sync --latest-flake-sync override-inputs .
+```
+
+The flake-sync on `PATH` is whatever version a lock pinned, such as the
+workspace development shell's `flake-sync` input. `--latest-flake-sync`
+makes that copy run `nix run --refresh github:clhodapp/flake-sync` with
+the same arguments, less the flag, so the command uses the head of
+flake-sync's default branch. It changes which flake-sync runs, not what
+the command operates on. `FLAKE_SYNC_UPSTREAM` names another flake to run
+instead. The started copy runs with `FLAKE_SYNC_LATEST_ACTIVE=1`, so it
+ignores the flag rather than starting another.
+
 ## Gotchas
 
 - **Detached HEADs block everything mutating.** Submodules checked out by

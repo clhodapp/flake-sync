@@ -121,6 +121,26 @@ git -C projects/lib checkout -q -- README.md
 git -C projects/lib reset -q --hard HEAD~1
 [ "$before" = "$(state_of_repos)" ] || fail "3d did not restore the repos"
 
+echo "=== 3e. --latest-flake-sync runs the flake named by FLAKE_SYNC_UPSTREAM with the same arguments"
+upstream=$HUB.upstream
+mkdir -p "$upstream"
+printf '#!/bin/sh\necho "upstream $*"\n' >"$upstream/run"
+chmod +x "$upstream/run"
+cat >"$upstream/flake.nix" <<'EOF'
+{
+  outputs = _: let app = { type = "app"; program = "${./run}"; }; in {
+    apps.x86_64-linux.default = app;
+    apps.aarch64-linux.default = app;
+  };
+}
+EOF
+out=$(FLAKE_SYNC_UPSTREAM="path:$upstream" $FS status --latest-flake-sync --fetch)
+[ "$out" = "upstream status --fetch" ] || fail "--latest-flake-sync runs the upstream with the other arguments (got '$out')"
+echo "ok: --latest-flake-sync runs the upstream with the same arguments, less the flag"
+out=$(FLAKE_SYNC_LATEST_ACTIVE=1 FLAKE_SYNC_UPSTREAM="path:$upstream" $FS --latest-flake-sync status)
+case $out in upstream*) fail "the started copy ran the upstream again" ;; esac
+expect_contains "$out" "machines" "the started copy ignores --latest-flake-sync and runs its status"
+
 echo "=== 4. converge finishes everything in DAG order"
 $FS converge
 for consumer in app machines; do

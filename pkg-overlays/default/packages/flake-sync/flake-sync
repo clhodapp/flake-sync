@@ -138,6 +138,13 @@ Options:
                         Ready external pins advance with the same check gate
                         and join the same update-pins commit as sibling pins
       --all             Shorthand for --with-partitions --with-tests --with-external
+      --latest-flake-sync
+                        Run the head of the flake that publishes flake-sync
+                        instead of this copy of flake-sync, through `nix run
+                        --refresh`, with the same arguments; it does not
+                        change what the command operates on
+                        (FLAKE_SYNC_UPSTREAM, default
+                        github:clhodapp/flake-sync, names the flake)
   -h, --help            Show this help
 
 The workspace is found from the current directory: the enclosing git repo,
@@ -156,6 +163,22 @@ EOF
 }
 
 # ---------------------------------------------------------------- utilities
+
+# --latest-flake-sync runs the head of flake-sync's flake in place of this
+# copy, with the same arguments less the flag. --refresh keeps nix from
+# answering with a github: ref it fetched within the last hour. The copy
+# it starts sees FLAKE_SYNC_LATEST_ACTIVE and runs itself.
+if [ "${FLAKE_SYNC_LATEST_ACTIVE:-}" != 1 ]; then
+  latest_wanted=false
+  latest_rest=()
+  for latest_arg in "$@"; do
+    if [ "$latest_arg" = --latest-flake-sync ]; then latest_wanted=true; else latest_rest+=("$latest_arg"); fi
+  done
+  if $latest_wanted; then
+    export FLAKE_SYNC_LATEST_ACTIVE=1
+    exec nix run --refresh "${FLAKE_SYNC_UPSTREAM:-github:clhodapp/flake-sync}" -- "${latest_rest[@]}"
+  fi
+fi
 
 DRY_RUN=false
 DO_FETCH=false
@@ -1343,6 +1366,7 @@ for arg in "$@"; do
     --with-tests) WITH_TESTS=true ;;
     --with-external) WITH_EXTERNAL=true ;;
     --all) WITH_PARTITIONS=true WITH_TESTS=true WITH_EXTERNAL=true ;;
+    --latest-flake-sync) ;; # handled before anything else; reaching here means this is that copy
     -h | --help) usage; exit 0 ;;
     -*) die "unknown option '$arg' (see --help)" ;;
     *) if [ -z "$CMD" ]; then CMD=$arg; else ARGS+=("$arg"); fi ;;
