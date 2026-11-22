@@ -72,6 +72,14 @@ Commands:
               full builds the checks); --with-partitions also checks
               partition/dev input flakes
   graph       Print the dependency DAG in topological order
+  overrides <flake-ref>
+              Print an `--override-input` flag for every input of the
+              lock of <flake-ref>, at any depth, that pins a workspace
+              repo at a commit other than the head of that repo's remote,
+              moving it to that head. External inputs are left out. It
+              reads .gitmodules and the remotes and changes nothing, so
+              its output can be passed to any flake command, e.g.
+              `nixos-rebuild switch --flake <ref> $(flake-sync overrides <ref>)`
 
 Step forms:
   step                          run the next ready action; if it fails, try
@@ -1223,6 +1231,58 @@ cmd_check() {
   fi
 }
 
+cmd_overrides() { # print --override-input flags that move flake $1's sibling inputs to their remotes' heads
+  [ "$#" -eq 1 ] || die "usage: flake-sync overrides <flake-ref>"
+  local ref=$1 key path url slug
+  # Sibling repos come from .gitmodules, so an uninitialized submodule
+  # counts too: owner/repo for a GitHub remote, else the normalized URL.
+  declare -A remote=()
+  while read -r key path; do
+    url=$(git config -f "$ROOT/.gitmodules" "${key%.path}.url")
+    slug=$(gh_slug "$url")
+    if [ -n "$slug" ]; then remote[gh:$slug]=$url; else remote[git:$(norm_url "$url")]=$url; fi
+  done < <(git config -f "$ROOT/.gitmodules" --get-regexp '^submodule\..*\.path$')
+
+  local meta
+  meta=$(nix flake metadata --json --refresh "$ref") || die "cannot read the lock of $ref"
+  # Every github or git input reached from the root along non-follows
+  # edges: "input/path<TAB>gh|git<TAB>owner/repo|url<TAB>locked-rev".
+  local nodes
+  nodes=$(jq -r '
+    .locks as $L
+    | def inputs_of($node; $prefix):
+        ($L.nodes[$node].inputs // {}) | to_entries[]
+        | select(.value | type == "string")
+        | ($prefix + [.key]) as $p
+        | ($L.nodes[.value].locked // {}) as $l
+        | (if $l.type == "github" then "\($p | join("/"))\tgh\t\($l.owner)/\($l.repo)\t\($l.rev)"
+           elif $l.type == "git" then "\($p | join("/"))\tgit\t\($l.url)\t\($l.rev)"
+           else empty end),
+          inputs_of(.value; $p);
+      inputs_of($L.root; [])' <<<"$meta")
+
+  declare -A tip=()
+  local input kind id rev k target
+  while IFS=$'\t' read -r input kind id rev; do
+    [ -n "$input" ] || continue
+    case $kind in
+      gh) k=gh:$id ;;
+      git) k=git:$(norm_url "$id") ;;
+    esac
+    [ -n "${remote[$k]:-}" ] || continue
+    if [ -z "${tip[$k]:-}" ]; then
+      tip[$k]=$(git ls-remote "${remote[$k]}" HEAD | cut -f1) || die "cannot read the head of ${remote[$k]}"
+      [ -n "${tip[$k]}" ] || die "${remote[$k]} has no HEAD"
+    fi
+    [ "${tip[$k]}" != "$rev" ] || continue
+    case $kind in
+      gh) target="github:$id/${tip[$k]}" ;;
+      git) target="git+$id?rev=${tip[$k]}" ;;
+    esac
+    printf -- '--override-input %s %s\n' "$input" "$target"
+  done <<<"$nodes"
+}
+
 cmd_graph() {
   local repo dep
   echo "topological order (dependencies first):"
@@ -1263,6 +1323,13 @@ command -v jq >/dev/null || die "jq is required"
 # pull without fetching would sync to yesterday's remote state
 [ "$CMD" != pull ] || DO_FETCH=true
 [ "$CMD" = pull ] || ! $HEADS || die "--heads applies to pull only"
+
+# overrides reads only .gitmodules and the remotes, so it needs none of
+# the working-tree state.
+if [ "$CMD" = overrides ]; then
+  cmd_overrides "${ARGS[@]}"
+  exit 0
+fi
 
 load_state
 

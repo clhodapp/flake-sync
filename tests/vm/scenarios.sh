@@ -56,6 +56,31 @@ echo "ok: hub lib.git is at lib HEAD"
 out=$($FS next)
 expect_contains "$out" "update-pins app" "next action re-pins app"
 
+echo "=== 3b. overrides moves the stale sibling inputs of a flake ref to the hub heads, read-only"
+state_of_repos() { # HEADs, hub refs, and porcelain status of every repo
+  local r
+  for r in lib app machines; do head_rev "projects/$r"; done
+  head_rev .
+  for r in lib app machines extdep workspace; do hub_rev "$r"; done
+  git status --porcelain --ignore-submodules=none
+  for r in lib app machines; do git -C "projects/$r" status --porcelain; done
+}
+before=$(state_of_repos)
+machines_ref="git+file://$HUB/machines.git"
+out=$($FS overrides "$machines_ref")
+lib_tip=$(hub_rev lib)
+expected="--override-input app/lib git+file://$HUB/lib.git?rev=$lib_tip
+--override-input lib git+file://$HUB/lib.git?rev=$lib_tip"
+[ "$(sort <<<"$out")" = "$expected" ] || { printf 'output was:\n%s\n' "$out" >&2; fail "overrides names lib and app/lib, and nothing else"; }
+echo "ok: overrides names the stale lib inputs, not the current app or the external extdep"
+[ "$before" = "$(state_of_repos)" ] || fail "overrides must not change any repo state"
+echo "ok: overrides is read-only"
+# The flags are separate words on purpose.
+# shellcheck disable=SC2086
+resolved=$(nix flake metadata --json "$machines_ref" $out | jq -r '.locks as $L | $L.nodes[$L.nodes[$L.root].inputs.lib].locked.rev')
+[ "$resolved" = "$lib_tip" ] || fail "the printed flags do not move lib to the hub head ($resolved)"
+echo "ok: the printed flags resolve lib to the hub head"
+
 echo "=== 4. converge finishes everything in DAG order"
 $FS converge
 for consumer in app machines; do

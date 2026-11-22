@@ -219,6 +219,31 @@ summary names the failures, and the exit status is nonzero if any failed.
 Use it to find out where the system stands before a converge, or after
 landing changes that didn't go through the gate.
 
+## Use pushed changes before they are re-pinned: overrides
+
+```sh
+flake-sync overrides <flake-ref>
+nixos-rebuild switch --flake <flake-ref> $(flake-sync overrides <flake-ref>)
+home-manager switch --flake <flake-ref> $(flake-sync overrides <flake-ref>)
+```
+
+`overrides` prints one `--override-input <path> <ref>` line for every
+input in the lock of `<flake-ref>` that pins a workspace repo at a commit
+other than the head of that repo's remote. `<ref>` names that head. The
+walk covers inputs at any depth that are not `follows`, so a repo that
+reaches the flake only through another input gets a nested path such as
+`app/lib`. External inputs, such as nixpkgs, are left out, as with
+`converge` without `--with-external`.
+
+The flake's lock comes from `nix flake metadata --refresh <flake-ref>`,
+the workspace repos from `.gitmodules` (an uninitialized submodule
+counts), and each head from `git ls-remote` against the repo's remote. No
+checkout is read beyond `.gitmodules`, and nothing is written, so it runs
+in any checkout of the workspace and works with any flake command. The
+result is close to what CI convergence pins once it finishes, without
+its checks: nothing evaluates the overridden inputs together before the
+flags are printed.
+
 ## Gotchas
 
 - **Detached HEADs block everything mutating.** Submodules checked out by
