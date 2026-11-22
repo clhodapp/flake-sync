@@ -80,6 +80,12 @@ Commands:
               reads .gitmodules and the remotes and changes nothing, so
               its output can be passed to any flake command, e.g.
               `nixos-rebuild switch --flake <ref> $(flake-sync overrides <ref>)`
+  overrides -- <command> [args...]
+              Run <command> with the input overrides of every
+              `--flake <ref>` (or `--flake=<ref>`) it names inserted right
+              after that argument, e.g.
+              `flake-sync overrides -- nixos-rebuild switch --flake <ref>`.
+              A command without --flake runs unchanged
 
 Step forms:
   step                          run the next ready action; if it fails, try
@@ -1283,6 +1289,29 @@ cmd_overrides() { # print --override-input flags that move flake $1's sibling in
   done <<<"$nodes"
 }
 
+cmd_overrides_run() { # run a command with the input overrides of each --flake it names, right after that --flake
+  [ "$#" -ge 1 ] || die "usage: flake-sync overrides -- <command> [args...]"
+  local out=() arg value line words
+  while [ "$#" -gt 0 ]; do
+    arg=$1; shift
+    value=""
+    case $arg in
+      --flake=*) out+=("$arg"); value=${arg#--flake=} ;;
+      --flake)
+        out+=("$arg")
+        if [ "$#" -gt 0 ]; then out+=("$1"); value=$1; shift; fi ;;
+      *) out+=("$arg") ;;
+    esac
+    [ -n "$value" ] || continue
+    while IFS= read -r line; do
+      [ -n "$line" ] || continue
+      read -ra words <<<"$line"
+      out+=("${words[@]}")
+    done < <(cmd_overrides "${value%%#*}")
+  done
+  exec "${out[@]}"
+}
+
 cmd_graph() {
   local repo dep
   echo "topological order (dependencies first):"
@@ -1297,6 +1326,13 @@ cmd_graph() {
 
 CMD=""
 ARGS=()
+# After `overrides --` the rest of the line is a command, so its options
+# are not flake-sync options.
+if [ "${1:-}" = overrides ] && [ "${2:-}" = -- ]; then
+  shift 2
+  command -v jq >/dev/null || die "jq is required"
+  cmd_overrides_run "$@"
+fi
 for arg in "$@"; do
   case $arg in
     -n | --dry-run) DRY_RUN=true ;;

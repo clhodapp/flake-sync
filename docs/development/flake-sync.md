@@ -222,10 +222,18 @@ landing changes that didn't go through the gate.
 ## Use pushed changes before they are re-pinned: overrides
 
 ```sh
-flake-sync overrides <flake-ref>
-nixos-rebuild switch --flake <flake-ref> $(flake-sync overrides <flake-ref>)
-home-manager switch --flake <flake-ref> $(flake-sync overrides <flake-ref>)
+flake-sync overrides -- nixos-rebuild switch --sudo --flake <flake-ref>
+flake-sync overrides -- home-manager switch --flake <flake-ref>
+flake-sync overrides <flake-ref>      # print the flags only
 ```
+
+`overrides -- <command>` runs `<command>` with the input overrides of
+every `--flake <ref>` or `--flake=<ref>` it names inserted right after
+that argument, the flake named by `<ref>` without any `#attr`. A command
+without `--flake` runs unchanged. This covers `nixos-rebuild`,
+`darwin-rebuild` and `home-manager`, which take `--flake` and pass
+`--override-input` to Nix. `system-manager` and `colmena` accept no input
+overrides in any form, so they cannot use it.
 
 `overrides` prints one `--override-input <path> <ref>` line for every
 input in the lock of `<flake-ref>` that pins a workspace repo at a commit

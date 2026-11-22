@@ -81,6 +81,21 @@ resolved=$(nix flake metadata --json "$machines_ref" $out | jq -r '.locks as $L 
 [ "$resolved" = "$lib_tip" ] || fail "the printed flags do not move lib to the hub head ($resolved)"
 echo "ok: the printed flags resolve lib to the hub head"
 
+echo "=== 3c. overrides -- runs a command with the overrides of its --flake right after that argument"
+out=$($FS overrides -- echo switch --flake "$machines_ref#host" --sudo)
+case $out in
+  "switch --flake $machines_ref#host --override-input "*" --sudo") ;;
+  *) printf 'output was:\n%s\n' "$out" >&2; fail "the overrides follow --flake and precede the other arguments" ;;
+esac
+expect_contains "$out" "--override-input lib git+file://$HUB/lib.git?rev=$lib_tip" "the --flake value without its #attr names the flake"
+out=$($FS overrides -- echo switch --flake="$machines_ref" --sudo)
+expect_contains "$out" "--flake=$machines_ref --override-input " "--flake=<ref> gets its overrides too"
+out=$($FS overrides -- echo no flake here)
+[ "$out" = "no flake here" ] || fail "a command without --flake runs unchanged (got '$out')"
+echo "ok: a command without --flake runs unchanged"
+[ "$before" = "$(state_of_repos)" ] || fail "overrides -- must not change any repo state"
+echo "ok: overrides -- is read-only"
+
 echo "=== 4. converge finishes everything in DAG order"
 $FS converge
 for consumer in app machines; do
