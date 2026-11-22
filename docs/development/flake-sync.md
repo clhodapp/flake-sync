@@ -219,26 +219,25 @@ summary names the failures, and the exit status is nonzero if any failed.
 Use it to find out where the system stands before a converge, or after
 landing changes that didn't go through the gate.
 
-## Use pushed changes before they are re-pinned: overrides
+## Use pushed changes before they are re-pinned: override
 
 ```sh
-flake-sync overrides -- nixos-rebuild switch --sudo --flake <flake-ref>
-flake-sync overrides -- home-manager switch --flake <flake-ref>
-flake-sync overrides <flake-ref>      # print the flags only
+nixos-rebuild switch --sudo --flake $(flake-sync override .)
+home-manager switch --flake $(flake-sync override '.#chris@chris-desktop-2')
+nix build $(flake-sync override '.#pkg')
 ```
 
-`overrides -- <command>` runs `<command>` with the input overrides of
-every `--flake <ref>` or `--flake=<ref>` it names inserted right after
-that argument, the flake named by `<ref>` without any `#attr`. A command
-without `--flake` runs unchanged. This covers `nixos-rebuild`,
-`darwin-rebuild` and `home-manager`, which take `--flake` and pass
-`--override-input` to Nix. `system-manager` and `colmena` accept no input
-overrides in any form, so they cannot use it.
+`override <flake-ref>` prints `<flake-ref>` and then one
+`--override-input <path> <ref>` pair for every input in its lock that
+pins a workspace repo at a commit other than the head of that repo's
+remote. `<ref>` names that head. The output takes the place of a flake
+reference in any command that accepts `--override-input`, unquoted so the
+shell splits it into words. A `#attr` on `<flake-ref>` stays on the
+printed reference and is ignored for the lookup. A local reference with a
+space in it is printed as the URL Nix resolves it to, with the space
+percent-encoded, so every word of the output is free of whitespace.
 
-`overrides` prints one `--override-input <path> <ref>` line for every
-input in the lock of `<flake-ref>` that pins a workspace repo at a commit
-other than the head of that repo's remote. `<ref>` names that head. The
-walk covers inputs at any depth that are not `follows`, so a repo that
+The walk covers inputs at any depth that are not `follows`, so a repo that
 reaches the flake only through another input gets a nested path such as
 `app/lib`. External inputs, such as nixpkgs, are left out, as with
 `converge` without `--with-external`.
@@ -247,10 +246,13 @@ The flake's lock comes from `nix flake metadata --refresh <flake-ref>`,
 the workspace repos from `.gitmodules` (an uninitialized submodule
 counts), and each head from `git ls-remote` against the repo's remote. No
 checkout is read beyond `.gitmodules`, and nothing is written, so it runs
-in any checkout of the workspace and works with any flake command. The
-result is close to what CI convergence pins once it finishes, without
-its checks: nothing evaluates the overridden inputs together before the
-flags are printed.
+in any checkout of the workspace. The result is close to what CI
+convergence pins once it finishes, without its checks: nothing evaluates
+the overridden inputs together before they are printed.
+
+`nixos-rebuild`, `darwin-rebuild`, `home-manager` and the nix CLI accept
+the output. `system-manager` and `colmena` accept no input overrides in any
+form, so `override` cannot help them.
 
 ## Gotchas
 

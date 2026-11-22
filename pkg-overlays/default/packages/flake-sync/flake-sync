@@ -72,20 +72,15 @@ Commands:
               full builds the checks); --with-partitions also checks
               partition/dev input flakes
   graph       Print the dependency DAG in topological order
-  overrides <flake-ref>
-              Print an `--override-input` flag for every input of the
-              lock of <flake-ref>, at any depth, that pins a workspace
-              repo at a commit other than the head of that repo's remote,
+  override <flake-ref>
+              Print <flake-ref>, then an `--override-input` flag for every
+              input in its lock, at any depth, that pins a workspace repo
+              at a commit other than the head of that repo's remote,
               moving it to that head. External inputs are left out. It
-              reads .gitmodules and the remotes and changes nothing, so
-              its output can be passed to any flake command, e.g.
-              `nixos-rebuild switch --flake <ref> $(flake-sync overrides <ref>)`
-  overrides -- <command> [args...]
-              Run <command> with the input overrides of every
-              `--flake <ref>` (or `--flake=<ref>`) it names inserted right
-              after that argument, e.g.
-              `flake-sync overrides -- nixos-rebuild switch --flake <ref>`.
-              A command without --flake runs unchanged
+              reads .gitmodules, the flake and the remotes and changes
+              nothing. Its output takes the place of a flake reference:
+              `nixos-rebuild switch --flake $(flake-sync override .)`,
+              `nix build $(flake-sync override '.#pkg')`
 
 Step forms:
   step                          run the next ready action; if it fails, try
@@ -1237,10 +1232,12 @@ cmd_check() {
   fi
 }
 
-cmd_overrides() { # print --override-input flags that move flake $1's sibling inputs to their remotes' heads
-  [ "$#" -eq 1 ] || die "usage: flake-sync overrides <flake-ref>"
-  local ref=$1 key path url slug
-  # Sibling repos come from .gitmodules, so an uninitialized submodule
+cmd_override() { # print flake ref $1 and the --override-input flags that move its workspace inputs to their remotes' heads
+  [ "$#" -eq 1 ] || die "usage: flake-sync override <flake-ref>"
+  local ref=$1 flake attr="" key path url slug
+  flake=${ref%%#*}
+  [ "$flake" = "$ref" ] || attr="#${ref#*#}"
+  # Workspace repos come from .gitmodules, so an uninitialized submodule
   # counts too: owner/repo for a GitHub remote, else the normalized URL.
   declare -A remote=()
   while read -r key path; do
@@ -1250,7 +1247,14 @@ cmd_overrides() { # print --override-input flags that move flake $1's sibling in
   done < <(git config -f "$ROOT/.gitmodules" --get-regexp '^submodule\..*\.path$')
 
   local meta
-  meta=$(nix flake metadata --json --refresh "$ref") || die "cannot read the lock of $ref"
+  meta=$(nix flake metadata --json --refresh "$flake") || die "cannot read the lock of $flake"
+  # The output is split into words by the shell, so a reference with a
+  # space is printed as the URL nix resolved it to, which encodes it.
+  local out=()
+  case $flake in
+    *" "*) out+=("$(jq -r .resolvedUrl <<<"$meta")$attr") ;;
+    *) out+=("$ref") ;;
+  esac
   # Every github or git input reached from the root along non-follows
   # edges: "input/path<TAB>gh|git<TAB>owner/repo|url<TAB>locked-rev".
   local nodes
@@ -1283,33 +1287,11 @@ cmd_overrides() { # print --override-input flags that move flake $1's sibling in
     [ "${tip[$k]}" != "$rev" ] || continue
     case $kind in
       gh) target="github:$id/${tip[$k]}" ;;
-      git) target="git+$id?rev=${tip[$k]}" ;;
+      git) target="git+${id// /%20}?rev=${tip[$k]}" ;;
     esac
-    printf -- '--override-input %s %s\n' "$input" "$target"
+    out+=(--override-input "$input" "$target")
   done <<<"$nodes"
-}
-
-cmd_overrides_run() { # run a command with the input overrides of each --flake it names, right after that --flake
-  [ "$#" -ge 1 ] || die "usage: flake-sync overrides -- <command> [args...]"
-  local out=() arg value line words
-  while [ "$#" -gt 0 ]; do
-    arg=$1; shift
-    value=""
-    case $arg in
-      --flake=*) out+=("$arg"); value=${arg#--flake=} ;;
-      --flake)
-        out+=("$arg")
-        if [ "$#" -gt 0 ]; then out+=("$1"); value=$1; shift; fi ;;
-      *) out+=("$arg") ;;
-    esac
-    [ -n "$value" ] || continue
-    while IFS= read -r line; do
-      [ -n "$line" ] || continue
-      read -ra words <<<"$line"
-      out+=("${words[@]}")
-    done < <(cmd_overrides "${value%%#*}")
-  done
-  exec "${out[@]}"
+  printf '%s\n' "${out[*]}"
 }
 
 cmd_graph() {
@@ -1326,13 +1308,6 @@ cmd_graph() {
 
 CMD=""
 ARGS=()
-# After `overrides --` the rest of the line is a command, so its options
-# are not flake-sync options.
-if [ "${1:-}" = overrides ] && [ "${2:-}" = -- ]; then
-  shift 2
-  command -v jq >/dev/null || die "jq is required"
-  cmd_overrides_run "$@"
-fi
 for arg in "$@"; do
   case $arg in
     -n | --dry-run) DRY_RUN=true ;;
@@ -1360,10 +1335,10 @@ command -v jq >/dev/null || die "jq is required"
 [ "$CMD" != pull ] || DO_FETCH=true
 [ "$CMD" = pull ] || ! $HEADS || die "--heads applies to pull only"
 
-# overrides reads only .gitmodules and the remotes, so it needs none of
-# the working-tree state.
-if [ "$CMD" = overrides ]; then
-  cmd_overrides "${ARGS[@]}"
+# override reads only .gitmodules, the flake and the remotes, so it needs
+# none of the working-tree state.
+if [ "$CMD" = override ]; then
+  cmd_override "${ARGS[@]}"
   exit 0
 fi
 
