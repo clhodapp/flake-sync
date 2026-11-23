@@ -853,6 +853,24 @@ expect_contains "$out" "app depends on lib, which has unpushed commits" "the ref
 [ "$(git --git-dir="$HUB/app.git" rev-parse agent-topic)" = "$(head_rev "$wt/projects/app")" ] || fail "app's topic branch should be on the hub"
 git -C "$wt/projects/app" diff --quiet "$(hub_rev app)" -- flake.lock || fail "app's topic branch must carry no lock move"
 echo "ok: topic branches push in dependency order and carry no pin moves"
+state_of() { jq -r --arg r "$1" '.[] | select(.repo == $r) | .state' <<<"$2"; }
+out=$(cd "$wt" && "$FS" --fetch unmerged-commits --json 2>/dev/null) || fail "unmerged-commits --json"
+[ "$(jq -r 'map(.repo) | join(" ")' <<<"$out")" = "lib app" ] || { echo "$out" >&2; fail "unmerged-commits should list lib, then app"; }
+[ "$(state_of lib "$out")" = ready ] || fail "lib depends on no listed repo, so it is ready"
+[ "$(state_of app "$out")" = "dependencies not ready" ] || fail "app waits on lib"
+[ "$(jq -r '.[] | select(.repo == "app") | .dependsOn | join(" ")' <<<"$out")" = lib ] || fail "app should name lib as its dependency"
+echo "ok: unmerged-commits lists the changes in dependency order with their readiness"
+# lib's pull request merges: its topic branch becomes the hub's main.
+git --git-dir="$HUB/lib.git" update-ref refs/heads/main "$(git --git-dir="$HUB/lib.git" rev-parse agent-topic)"
+out=$(cd "$wt" && "$FS" --fetch unmerged-commits --json 2>/dev/null) || fail "unmerged-commits --json after the merge"
+[ "$(jq -r 'map(.repo) | join(" ")' <<<"$out")" = app ] || { echo "$out" >&2; fail "only app should be left"; }
+[ "$(state_of app "$out")" = "waiting for convergence" ] || fail "app's main still pins the old lib"
+echo "ok: after the dependency merges, the consumer waits for convergence"
+$FS --heads pull >/dev/null 2>&1 || fail "pull --heads in the primary"
+$FS --fetch converge >/dev/null 2>&1 || fail "converge in the primary after the merge"
+out=$(cd "$wt" && "$FS" --fetch unmerged-commits --json 2>/dev/null) || fail "unmerged-commits --json after convergence"
+[ "$(state_of app "$out")" = ready ] || { echo "$out" >&2; fail "app should be ready once its main pins the merged lib"; }
+echo "ok: once the default branch converges, the consumer is ready"
 git worktree remove --force "$wt"
 for s in lib app machines; do git -C "$modules/projects/$s" worktree prune; done
 

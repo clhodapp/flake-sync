@@ -73,6 +73,17 @@ Commands:
               full builds the checks); --with-partitions also checks
               partition/dev input flakes
   graph       Print the dependency DAG in topological order
+  unmerged-commits [--json]
+              List, in DAG order, the checked-out repos whose branch has
+              commits besides pin updates that are not on the remote
+              default branch: the branch, whether it is pushed, the
+              commits, the listed repos it depends on, its pull request
+              (GitHub remotes), and its state. "dependencies not ready":
+              a repo it depends on is listed. "waiting for convergence":
+              its default branch pins a workspace dependency at a commit
+              other than that dependency's remote default head. "ready":
+              neither; its pull request can leave draft. --json prints
+              the same as a JSON array
   checkout <repo>... | --all
               Clone the named submodules that are not checked out here,
               or with --all every one, and attach each to its default
@@ -1724,6 +1735,84 @@ cmd_checkout() { # clone the named absent submodules, or with --all every one
   [ ${#failed[@]} -eq 0 ] || die "checkout failed for: ${failed[*]}"
 }
 
+default_ref() { # origin/<default branch> of checked-out repo $1
+  local ref
+  ref=$(git -C "${DIR[$1]}" symbolic-ref --quiet --short refs/remotes/origin/HEAD || echo origin/main)
+  echo "$ref"
+}
+
+remote_head() { # the remote default-branch head of repo $1
+  if [ -n "${ABSENT[$1]:-}" ]; then echo "${HEADREV[$1]}"; else git -C "${DIR[$1]}" rev-parse --quiet --verify "$(default_ref "$1")" || true; fi
+}
+
+cmd_unmerged_commits() { # repos whose branch holds commits besides pin updates that are not on the remote default branch, in DAG order
+  local json=false
+  case "${1:-}" in --json) json=true; shift ;; esac
+  [ $# -eq 0 ] || die "unmerged-commits takes no arguments besides --json"
+  local repo dir base listed=() commits
+  local -A COMMITS=()
+  for repo in "${TOPO[@]}"; do
+    [ -n "${DIR[$repo]:-}" ] || continue
+    dir=${DIR[$repo]}
+    base=$(default_ref "$repo")
+    git -C "$dir" rev-parse --quiet --verify "$base" >/dev/null || continue
+    commits=$(git -C "$dir" log --reverse --format='%h %s' "$base..HEAD" \
+      | grep -v -e '^[0-9a-f]* maint: update flake pins (' -e '^[0-9a-f]* maint: bump ' || true)
+    [ -n "$commits" ] || continue
+    COMMITS[$repo]=$commits
+    listed+=("$repo")
+  done
+  local lines=() dep listed_deps state pushed pr input target rev fd lock
+  for repo in ${listed[@]+"${listed[@]}"}; do
+    dir=${DIR[$repo]}
+    base=$(default_ref "$repo")
+    listed_deps=()
+    for dep in ${DEPS[$repo]:-}; do
+      [ -n "${COMMITS[$dep]:-}" ] && listed_deps+=("$dep")
+    done
+    if [ ${#listed_deps[@]} -gt 0 ]; then
+      state="dependencies not ready"
+    else
+      # Converged when the default branch pins every workspace dependency
+      # at that dependency's remote default head.
+      state=ready
+      lock=$(mktemp)
+      if git -C "$dir" show "$base:flake.lock" >"$lock" 2>/dev/null; then
+        local saved_pins=${PINS[$repo]:-} saved_deps=${DEPS[$repo]:-} saved_ext=${EXTPINS[$repo]:-}
+        PINS[$repo]='' DEPS[$repo]=''
+        read_lock_pins "$repo" "$lock" "."
+        while IFS=$'\t' read -r input target rev fd; do
+          [ -n "$input" ] || continue
+          [ "$rev" = "$(remote_head "$target")" ] || { state="waiting for convergence"; break; }
+        done <<<"${PINS[$repo]}"
+        PINS[$repo]=$saved_pins DEPS[$repo]=$saved_deps EXTPINS[$repo]=$saved_ext
+      fi
+      rm -f "$lock"
+    fi
+    if [ "${AHEAD[$repo]}" -eq 0 ]; then pushed=yes; else pushed=no; fi
+    pr=""
+    if [ -n "${SLUG[$repo]:-}" ] && [ "${BRANCH[$repo]}" != "(detached)" ]; then
+      pr=$("$GH" pr list -R "${SLUG[$repo]}" --head "${BRANCH[$repo]}" --state all \
+        --json number,state,isDraft,url --jq 'first // empty | "\(.url) \(if .isDraft then "DRAFT" else .state end)"' 2>/dev/null || true)
+    fi
+    if $json; then
+      lines+=("$(jq -n --arg repo "$repo" --arg branch "${BRANCH[$repo]}" --arg pushed "$pushed" \
+        --arg state "$state" --arg pr "$pr" --arg commits "${COMMITS[$repo]}" \
+        --args '{repo: $repo, branch: $branch, pushed: ($pushed == "yes"), state: $state,
+                 dependsOn: $ARGS.positional, pullRequest: (if $pr == "" then null else $pr end),
+                 commits: ($commits | split("\n"))}' ${listed_deps[@]+"${listed_deps[@]}"})")
+    else
+      echo "${C_BLD}$repo${C_OFF} ($state) on ${BRANCH[$repo]}, $([ "$pushed" = yes ] && echo pushed || echo "not pushed")${listed_deps[0]+, depends on ${listed_deps[*]}}${pr:+, pull request $pr}"
+      while IFS= read -r commits; do echo "  $commits"; done <<<"${COMMITS[$repo]}"
+    fi
+  done
+  if $json; then
+    printf '%s\n' ${lines[@]+"${lines[@]}"} | jq -s .
+  elif [ ${#listed[@]} -eq 0 ]; then
+    echo "no unmerged commits besides pin updates"
+  fi
+}
+
 cmd_graph() {
   local repo dep
   echo "topological order (dependencies first):"
@@ -1750,6 +1839,7 @@ for arg in "$@"; do
     --local) LOCAL=true ;;
     --checkout-missing) CHECKOUT_MISSING=true ;;
     --trust-local-checks) TRUST_LOCAL_CHECKS=true ;;
+    --json) ARGS+=("$arg") ;; # unmerged-commits
     --with-partitions) WITH_PARTITIONS=true ;;
     --with-tests) WITH_TESTS=true ;;
     --with-external) WITH_EXTERNAL=true ;;
@@ -1808,5 +1898,6 @@ case $CMD in
   pull) cmd_pull "${ARGS[@]}" ;;
   check) cmd_check "${ARGS[@]}" ;;
   graph) cmd_graph "${ARGS[@]}" ;;
+  unmerged-commits) cmd_unmerged_commits "${ARGS[@]}" ;;
   *) die "unknown command '$CMD' (see --help)" ;;
 esac

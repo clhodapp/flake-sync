@@ -250,6 +250,24 @@ against local, unpushed changes of other repos, use
 refuses while a repo it depends on has commits that are not pushed yet,
 so branches reach the remote in dependency order.
 
+`unmerged-commits` (`--json` for scripts) lists, in DAG order, the
+checked-out repos whose branch has commits besides pin updates that are
+not on the remote default branch, with the branch, whether it is pushed,
+the commits, the listed repos it depends on, its pull request on a
+GitHub remote, and one of three states:
+
+- **dependencies not ready**: a repo it depends on is listed, so the
+  change it needs is not merged yet. Its pull request stays a draft.
+- **waiting for convergence**: nothing it depends on is listed, but its
+  default branch pins a workspace dependency at a commit other than that
+  dependency's remote default head. Convergence moves the pin; run
+  `--fetch unmerged-commits` again afterwards.
+- **ready**: its default branch pins every workspace dependency at the
+  remote head, so the pull request can leave draft once the branch is
+  rebased onto the default branch.
+
+The listed order is the order to open and merge the pull requests in.
+
 ## Local convergence: check and accelerate, publish nothing
 
 ```sh
