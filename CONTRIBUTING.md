@@ -56,10 +56,11 @@ bash -n src/flake-sync                                  # syntax, while editing
 nix build '.#checks.x86_64-linux.flake-sync-package'    # build + shellcheck
 nix build '.#checks.x86_64-linux.treefmt'               # formatting
 nix build '.#checks.x86_64-linux.vm-lifecycle' -L       # the lifecycle test
+nix build '.#checks.x86_64-linux.vm-verify-locks' -L    # the verifier scenarios
 nix fmt                                                 # format the Nix files
 ```
 
-`nix flake check` runs all three checks.
+`nix flake check` runs these checks.
 
 ## The lifecycle test
 

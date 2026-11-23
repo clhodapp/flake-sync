@@ -1,0 +1,182 @@
+# SPDX-License-Identifier: MIT
+#
+# Runs flake-sync-verify-locks on a pull request and reports the result
+# as the commit status `flake-sync/verify-locks`. A repository calls it
+# from a workflow triggered by pull_request_target, so the copy of the
+# caller that runs is the one on the base branch, not the one in the
+# pull request. docs/development/flake-sync.md (Verifying lock changes)
+# shows the caller and the ruleset that requires the status.
+#
+# The verify job reads the pull request's files and evaluates its
+# flake.nix files, so it holds no secrets and a read-only token. The
+# report job holds the App token and runs no code from the pull request.
+
+name: verify-locks
+
+on:
+  workflow_call:
+    inputs:
+      flake-sync:
+        description: The full hash of the flake-sync commit whose verifier runs, the same commit the caller names in `uses:`.
+        type: string
+        required: true
+      app-id:
+        description: >-
+          The ID of the GitHub App that posts the status. A ruleset that
+          requires the status from this App accepts no status that a
+          workflow in a pull request posts. Without it, the status comes
+          from GitHub Actions.
+        type: string
+        default: ""
+      act-on-pin-moves:
+        description: >-
+          For a pull request from a flake-sync/pins/ branch of the same
+          repository, turn on auto-merge when the check passes and close
+          the pull request when it fails.
+        type: boolean
+        default: false
+    secrets:
+      app-private-key:
+        description: The private key of the App named by app-id.
+        required: false
+
+permissions: {}
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    outputs:
+      verdict: ${{ steps.verify.outputs.verdict }}
+      pin-move: ${{ steps.mode.outputs.pin-move }}
+    steps:
+      - name: Check how the workflow is called
+        env:
+          EVENT: ${{ github.event_name }}
+          FLAKE_SYNC: ${{ inputs.flake-sync }}
+        run: |
+          if [[ $EVENT != pull_request_target ]]; then
+            echo "::error::Call verify-locks from a pull_request_target workflow; under $EVENT the pull request supplies the workflow that checks it."
+            exit 1
+          fi
+          if [[ ! $FLAKE_SYNC =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::inputs.flake-sync must be a full commit hash."
+            exit 1
+          fi
+
+      - name: Decide whether this is a pin move
+        id: mode
+        env:
+          HEAD_REF: ${{ github.event.pull_request.head.ref }}
+          HEAD_REPO: ${{ github.event.pull_request.head.repo.full_name }}
+          REPO: ${{ github.repository }}
+        run: |
+          if [[ $HEAD_REPO == "$REPO" && $HEAD_REF == flake-sync/pins/* ]]; then
+            echo "pin-move=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "pin-move=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ github.event.pull_request.base.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Fetch the pull request
+        env:
+          NUMBER: ${{ github.event.pull_request.number }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          TOKEN: ${{ github.token }}
+        run: |
+          auth=$(printf 'x-access-token:%s' "$TOKEN" | base64 -w0)
+          git -c "http.https://github.com/.extraheader=AUTHORIZATION: basic $auth" \
+            fetch --quiet origin "+refs/pull/$NUMBER/head:refs/remotes/pull/head"
+          fetched=$(git rev-parse refs/remotes/pull/head)
+          if [[ $fetched != "$HEAD_SHA" ]]; then
+            echo "::error::The pull request moved to $fetched after this run started; the run for the new head checks it."
+            exit 1
+          fi
+
+      - uses: cachix/install-nix-action@13d8dd58da0234aa297dedd986986ccb8e7f3e24 # v31
+        with:
+          github_access_token: ${{ github.token }}
+          extra_nix_config: |
+            experimental-features = nix-command flakes
+            accept-flake-config = false
+
+      - name: Verify the lock changes
+        id: verify
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          FLAKE_SYNC: ${{ inputs.flake-sync }}
+          PIN_MOVE: ${{ steps.mode.outputs.pin-move }}
+        run: |
+          args=()
+          [[ $PIN_MOVE == true ]] && args+=(--pin-move)
+          rc=0
+          nix run "github:clhodapp/flake-sync/$FLAKE_SYNC#flake-sync-verify-locks" -- \
+            "${args[@]}" "$BASE_SHA" "$HEAD_SHA" || rc=$?
+          case $rc in
+            0) echo "verdict=accepted" >> "$GITHUB_OUTPUT" ;;
+            1) echo "verdict=rejected" >> "$GITHUB_OUTPUT" ;;
+          esac
+          exit "$rc"
+
+  report:
+    needs: verify
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+      pull-requests: write
+      statuses: write
+    steps:
+      - name: Mint the App token
+        id: app
+        if: inputs.app-id != ''
+        uses: actions/create-github-app-token@f418cff399f7aef4c2f0ad47e25ca7a6abbdd6fc # v3.4.0
+        with:
+          app-id: ${{ inputs.app-id }}
+          private-key: ${{ secrets.app-private-key }}
+
+      - name: Post the status, and merge or close a pin move
+        env:
+          GH_TOKEN: ${{ steps.app.outputs.token || github.token }}
+          REPO: ${{ github.repository }}
+          NUMBER: ${{ github.event.pull_request.number }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          VERDICT: ${{ needs.verify.outputs.verdict }}
+          PIN_MOVE: ${{ needs.verify.outputs.pin-move }}
+          ACT: ${{ inputs.act-on-pin-moves }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          case $VERDICT in
+            accepted) state=success description="The lock changes are what flake-sync and Nix write." ;;
+            rejected) state=failure description="The lock changes were refused; the run log gives the reasons." ;;
+            *) state=error description="The check did not finish." ;;
+          esac
+          gh api --silent "repos/$REPO/statuses/$HEAD_SHA" \
+            -f state="$state" -f context=flake-sync/verify-locks \
+            -f description="$description" -f target_url="$RUN_URL"
+
+          [[ $ACT == true && $PIN_MOVE == true ]] || exit 0
+          case $VERDICT in
+            accepted)
+              # The first merge method the repository allows, in the
+              # order flake-sync tries them; the merge is bound to the
+              # checked head.
+              method=$(gh api "repos/$REPO" --jq \
+                'if .allow_rebase_merge then "rebase" elif .allow_squash_merge then "squash" else "merge" end')
+              gh pr merge "$NUMBER" -R "$REPO" --auto "--$method" --match-head-commit "$HEAD_SHA"
+              ;;
+            rejected)
+              gh pr close "$NUMBER" -R "$REPO" --delete-branch \
+                --comment "flake-sync-verify-locks refused this pin move. The reasons are in the run log: $RUN_URL"
+              ;;
+          esac

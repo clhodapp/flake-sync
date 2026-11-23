@@ -157,6 +157,93 @@ nothing else, so it is not a topic branch. It is named
 move writes, so two runs that make the same move meet at one branch:
 the second finds it open, names its pull request, and stops.
 
+## Verifying lock changes
+
+`flake-sync-verify-locks [--pin-move] <base> <head>`
+([`src/flake-sync-verify-locks`](../../src/flake-sync-verify-locks),
+the package `flake-sync-verify-locks`) checks the `flake.lock` files
+and submodule pointers that `<head>` changes since its merge base with
+`<base>`, in the repository of the current directory. It exits 0 when
+the changes pass and 1 with the reasons when they do not; `--help`
+lists the checks.
+
+It rebuilds each changed lock. Starting from the lock at the merge
+base, with the `flake.nix` of the head, it holds each input that the
+head adds or moves at the commit the head locks, runs `nix flake lock`,
+and compares the result with the head's lock byte for byte. Before it
+holds an input there, it clones the history of the branch or tag that
+the input's `original` names, or of the default branch when `original`
+names none, and requires the commit to be on it. A moved input must
+also descend from the commit it moves from. The clone holds only that
+history, so a commit that GitHub serves under the upstream's name but
+that only a fork holds is not found in it. `locked` must name the same
+repository as `original`, because `--override-input` keeps `original`
+from `flake.nix` whatever repository it locks. A submodule pointer gets
+the same history check, against the branch that `.gitmodules` names.
+
+Without `--pin-move`, the inputs locked at the merge base and the
+submodule pointers stay where they are, and a pull request may add
+inputs and submodules. With `--pin-move`, each commit has one parent
+and changes `flake.lock` files and submodule pointers only, and nothing
+is added. A pin move of an input other than a `github` or `git` one,
+such as a tarball, is refused, since its commits cannot be traced; an
+added one passes when `nix flake lock` fetches the same content from
+the URL in `flake.nix`.
+
+`tests/vm/verify-locks.sh` holds a scenario for each change the
+verifier refuses, and for the pin moves and added inputs it accepts.
+
+### The verify-locks workflow
+
+[`.github/workflows/verify-locks.yml`](../../.github/workflows/verify-locks.yml)
+runs the verifier on a pull request. A repository calls it from a
+workflow triggered by `pull_request_target`, which runs the copy of the
+caller on the base branch:
+
+```yaml
+name: verify-locks
+on:
+  pull_request_target:
+    types: [opened, synchronize, reopened, edited]
+permissions: {}
+jobs:
+  verify-locks:
+    uses: clhodapp/flake-sync/.github/workflows/verify-locks.yml@<commit>
+    permissions:
+      contents: write
+      pull-requests: write
+      statuses: write
+    with:
+      flake-sync: <commit>
+      app-id: ${{ vars.VERIFY_LOCKS_APP_ID }}
+      act-on-pin-moves: true
+    secrets:
+      app-private-key: ${{ secrets.VERIFY_LOCKS_APP_PRIVATE_KEY }}
+```
+
+`<commit>` is the full hash of a flake-sync commit, the same in both
+places. A pull request from a `flake-sync/pins/` branch of the same
+repository is checked as a pin move; any other pull request gets the
+checks without `--pin-move`.
+
+The verify job evaluates the `flake.nix` files of the pull request, so
+it runs with a read-only token and no secrets. The report job posts the
+result as the commit status `flake-sync/verify-locks` on the head
+commit, and runs no code from the pull request. With `app-id`, the
+status comes from that GitHub App, which needs write access to commit
+statuses, and to contents and pull requests for `act-on-pin-moves`. A
+ruleset on the default branch then requires `flake-sync/verify-locks`
+from that App. A ruleset that requires it from GitHub Actions is
+weaker, since a workflow that a pull request adds can report a check
+of the same name from GitHub Actions.
+
+With `act-on-pin-moves`, a pin move that passes gets auto-merge, bound
+to the checked head commit, so it merges once the other required
+checks pass; the repository must allow auto-merge. A pin move that
+fails is closed and its branch deleted. When flake-sync's immediate
+merge of a pin move waits on the status, it turns on auto-merge too
+(§ How pin commits are published).
+
 ## Down-sync: pull
 
 ```sh
@@ -558,6 +645,7 @@ files must be `git add`ed first or the flake source won't include them):
 
 ```sh
 nix build '.#checks.x86_64-linux.vm-lifecycle' -L --no-link
+nix build '.#checks.x86_64-linux.vm-verify-locks' -L --no-link
 ```
 
 The fixture only works because the script supports git/file remotes in

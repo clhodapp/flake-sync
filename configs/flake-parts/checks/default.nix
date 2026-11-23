@@ -32,6 +32,14 @@
           category = "vm";
           description = "the packaged executable converges a workspace of local bare repositories and a fake GitHub, offline";
         };
+        vm-verify-locks = {
+          derivation = import ../../../tests/vm/verify-locks.nix {
+            inherit pkgs;
+            inherit (pkgs.flake-sync) flake-sync-verify-locks;
+          };
+          category = "vm";
+          description = "flake-sync-verify-locks accepts pin moves and added inputs that flake-sync and Nix make, and refuses lock changes that carry other commits, offline";
+        };
       };
     };
 }

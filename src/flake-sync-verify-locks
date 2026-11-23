@@ -1,0 +1,483 @@
+#!/usr/bin/env bash
+# SPDX-License-Identifier: MIT
+#
+# Checks the flake.lock files and submodule pointers that a pull request
+# changes, so that a lock change cannot carry a commit that the pull
+# request's flake.nix and the inputs' upstream branches do not account
+# for. docs/development/flake-sync.md (Verifying lock changes) describes
+# the checks and the workflow that runs them.
+#
+# The lock files, flake.nix files and .gitmodules read here come from the
+# pull request, so every value taken from them is validated before it
+# reaches git or a command line, and the final comparison is byte for
+# byte against what Nix writes.
+
+set -euo pipefail
+
+usage() {
+  cat <<'EOF'
+usage: flake-sync-verify-locks [--pin-move] <base> <head>
+
+Checks the flake.lock files and submodule pointers that <head> changes
+relative to its merge base with <base>, in the git repository of the
+current directory. Exits 0 when the changes pass, 1 with the reasons
+when they do not, and 2 on a usage error.
+
+For every pull request:
+  - a changed flake.lock is a regular file with a regular flake.nix
+    beside it, and a deleted flake.lock leaves no flake.nix behind;
+  - <base> has not changed that flake.lock or flake.nix since the
+    merge base;
+  - an input the lock adds locks a commit on the branch or tag that
+    flake.nix names for it, or on the default branch;
+  - the inputs already locked at the merge base stay where they are,
+    and so do submodule pointers; a new submodule points at a commit on
+    the branch .gitmodules names for it;
+  - the lock is byte for byte what `nix flake lock` writes from the
+    merge base's lock and the head's flake.nix, with the added inputs
+    held at the commits the head locks.
+
+With --pin-move, for a pull request that only moves pins:
+  - each commit has one parent and changes flake.lock files and
+    submodule pointers only;
+  - an input or submodule pointer may move, to a commit on the branch it
+    tracks that descends from the commit it moves from; inputs and
+    submodules are neither added nor removed.
+EOF
+}
+
+die() {
+  printf 'flake-sync-verify-locks: %s\n' "$*" >&2
+  exit 2
+}
+
+PROBLEMS=()
+reject() { PROBLEMS+=("$*"); }
+
+PIN_MOVE=false
+POS=()
+for arg in "$@"; do
+  case $arg in
+    --pin-move) PIN_MOVE=true ;;
+    -h | --help)
+      usage
+      exit 0
+      ;;
+    -*) die "unknown option $arg" ;;
+    *) POS+=("$arg") ;;
+  esac
+done
+[ "${#POS[@]}" -eq 2 ] || {
+  usage >&2
+  exit 2
+}
+
+TOP=$(git rev-parse --show-toplevel 2>/dev/null) || die "not in a git repository"
+cd "$TOP"
+BASE=$(git rev-parse --verify --quiet "${POS[0]}^{commit}") || die "unknown commit ${POS[0]}"
+HEAD=$(git rev-parse --verify --quiet "${POS[1]}^{commit}") || die "unknown commit ${POS[1]}"
+MB=$(git merge-base "$BASE" "$HEAD") || die "${POS[0]} and ${POS[1]} have no merge base"
+
+TMP=$(mktemp -d)
+WT=""
+cleanup() {
+  [ -z "$WT" ] || git worktree remove --force "$WT" >/dev/null 2>&1 || true
+  rm -rf "$TMP"
+}
+trap cleanup EXIT
+
+# The repositories cloned below hold commit history only, fetched from a
+# named branch or tag. A commit that is not on it must stay missing,
+# rather than be fetched by its hash on demand.
+export GIT_NO_LAZY_FETCH=1
+
+# git for URLs taken from the pull request: https and local files only,
+# so a URL cannot select a transport that runs commands.
+gitf() {
+  git -c protocol.allow=never -c protocol.https.allow=always -c protocol.file.allow=always "$@"
+}
+
+# Nix as the verifier runs it: no settings from the flake under test, no
+# registries (mutable, fetched from the network), and no builds.
+NIX=(nix --extra-experimental-features 'nix-command flakes'
+  --option accept-flake-config false
+  --option use-registries false
+  --option allow-import-from-derivation false)
+
+mode_at() { # print the mode of path $2 in commit $1, or nothing when absent
+  git ls-tree "$1" -- "$2" | awk '{ print $1; exit }'
+}
+
+blob_at() { # print the object id of path $2 in commit $1, or nothing when absent
+  git rev-parse --verify --quiet "$1:$2" || true
+}
+
+beside() { # print path $2 in directory $1 (as dirname prints it)
+  if [ "$1" = . ]; then printf '%s\n' "$2"; else printf '%s\n' "$1/$2"; fi
+}
+
+is_rev() { [[ $1 =~ ^[0-9a-f]{40}$ ]]; }
+
+fetch_url() { # print URL $1 normalized to one gitf may fetch, or fail
+  local u=$1 origin
+  case $u in
+    git@github.com:*) u="https://github.com/${u#git@github.com:}" ;;
+    ssh://git@github.com/*) u="https://github.com/${u#ssh://git@github.com/}" ;;
+    ../* | ./*)
+      origin=$(git remote get-url origin 2>/dev/null) || return 1
+      origin=$(fetch_url "$origin") || return 1
+      origin=${origin%/}
+      while :; do
+        case $u in
+          ../*)
+            origin=${origin%/*}
+            u=${u#../}
+            ;;
+          ./*) u=${u#./} ;;
+          *) break ;;
+        esac
+      done
+      u="$origin/$u"
+      ;;
+    /*) u="file://$u" ;;
+  esac
+  [[ $u =~ ^(https://[A-Za-z0-9.-]+/|file:///)[A-Za-z0-9._~/%+-]*$ ]] || return 1
+  printf '%s\n' "$u"
+}
+
+branch_arg() { # print the --branch value for tracked ref $1 ("" for HEAD), or fail
+  case $1 in
+    HEAD) printf '\n' ;;
+    refs/heads/* | refs/tags/*)
+      git check-ref-format "$1" || return 1
+      printf '%s\n' "${1#refs/*/}"
+      ;;
+    refs/* | -*) return 1 ;;
+    *)
+      git check-ref-format --allow-onelevel "$1" || return 1
+      printf '%s\n' "$1"
+      ;;
+  esac
+}
+
+CLONES=0
+clone_tracked() { # clone the history of ref $2 of URL $1 into $3, limited to depth $4 (0: full)
+  local args=(clone --quiet --bare --no-tags --single-branch --filter=tree:0)
+  [ "$4" -eq 0 ] || args+=(--depth "$4")
+  [ -z "$2" ] || args+=(--branch "$2")
+  rm -rf "$3"
+  gitf "${args[@]}" -- "$1" "$3" 2>"$TMP/clone.err"
+}
+
+# Succeed when commit $4 is on ref $3 of URL $2 and, given $5, descends
+# from commit $5; otherwise reject with label $1 and fail. Only the
+# history of the ref is fetched, so a commit that exists upstream only
+# outside it (in a fork's object network, or behind another ref) is
+# missing, and the check fails.
+on_tracked_ref() {
+  local label=$1 url=$2 ref=$3 rev=$4 old=${5:-} branch g depth on=false forward=false
+  branch=$(branch_arg "$ref") || {
+    reject "$label tracks $ref, which is not a branch or tag name"
+    return 1
+  }
+  CLONES=$((CLONES + 1))
+  g=$TMP/clones/$CLONES
+  mkdir -p "$TMP/clones"
+  for depth in 1000 0; do
+    if ! clone_tracked "$url" "$branch" "$g" "$depth"; then
+      reject "$label: cannot fetch $ref of $url: $(tail -n 1 "$TMP/clone.err")"
+      return 1
+    fi
+    on=false forward=false
+    if git -C "$g" merge-base --is-ancestor "$rev" HEAD 2>/dev/null; then
+      on=true
+      if [ -z "$old" ] || git -C "$g" merge-base --is-ancestor "$old" "$rev" 2>/dev/null; then
+        forward=true
+      fi
+    fi
+    $forward && return 0
+    [ "$(git -C "$g" rev-parse --is-shallow-repository)" = true ] || break
+  done
+  if ! $on; then
+    reject "$label locks $rev, which is not on $ref of $url"
+  else
+    reject "$label moves from $old to $rev, which does not descend from it"
+  fi
+  return 1
+}
+
+# Print the flake reference that holds an input at locked attrs $1,
+# without the attributes Nix computes from the content.
+locked_ref() {
+  FLAKE_SYNC_LOCKED=$1 "${NIX[@]}" eval --raw --impure --expr \
+    'builtins.flakeRefToString (removeAttrs (builtins.fromJSON (builtins.getEnv "FLAKE_SYNC_LOCKED")) [ "narHash" "lastModified" "lastModifiedDate" "revCount" ])'
+}
+
+# ------------------------------------------------------------ the changes
+
+LOCKS=() # changed lock files to regenerate, at the head
+LINKS=() # changed submodule pointers: status, path
+
+pin_move_entry() { # succeed when raw diff entry ($1 old mode, $2 new mode, $3 status, $4 path) may be in a pin move
+  case $3 in
+    M)
+      if [ "$1" = 100644 ] && [ "$2" = 100644 ] && [ "$(basename "$4")" = flake.lock ]; then return 0; fi
+      if [ "$1" = 160000 ] && [ "$2" = 160000 ]; then return 0; fi
+      ;;
+  esac
+  return 1
+}
+
+diff_entries() { # print "oldmode newmode status" and the path, NUL-separated, for each change from $1 to $2
+  local meta path om nm st
+  while IFS= read -r -d '' meta && IFS= read -r -d '' path; do
+    read -r om nm _ _ st <<<"${meta#:}"
+    printf '%s %s %s\0%s\0' "$om" "$nm" "$st" "$path"
+  done < <(git diff --raw -z --no-renames --no-abbrev --no-ext-diff "$1" "$2" --)
+}
+
+while IFS= read -r -d '' meta && IFS= read -r -d '' path; do
+  read -r om nm st <<<"$meta"
+  if $PIN_MOVE && ! pin_move_entry "$om" "$nm" "$st" "$path"; then
+    reject "a pin move changes $path, which is neither a flake.lock nor a submodule pointer"
+  fi
+  if [ "$om" = 160000 ] || [ "$nm" = 160000 ]; then
+    [ "$st" = D ] || LINKS+=("$st" "$path")
+    continue
+  fi
+  [ "$(basename "$path")" = flake.lock ] || continue
+  dir=$(dirname "$path")
+  nixp=$(beside "$dir" flake.nix)
+  if [ "$st" = D ]; then
+    [ -z "$(mode_at "$HEAD" "$nixp")" ] ||
+      reject "$path is deleted while $nixp remains, so Nix would lock its inputs afresh"
+    continue
+  fi
+  if [ "$nm" != 100644 ]; then
+    reject "$path is not a regular file (mode $nm)"
+    continue
+  fi
+  if [ "$(mode_at "$HEAD" "$nixp")" != 100644 ]; then
+    reject "$path has no regular file $nixp beside it"
+    continue
+  fi
+  for f in "$path" "$nixp"; do
+    [ "$(blob_at "$MB" "$f")" = "$(blob_at "$BASE" "$f")" ] ||
+      reject "$f changed on the base branch after the pull request branched from it; rebase the pull request"
+  done
+  LOCKS+=("$path")
+done < <(diff_entries "$MB" "$HEAD")
+
+if $PIN_MOVE; then
+  while read -r commit parents; do
+    read -ra ps <<<"$parents"
+    if [ "${#ps[@]}" -ne 1 ]; then
+      reject "commit $commit has ${#ps[@]} parents; a pin move is a line of single-parent commits"
+      continue
+    fi
+    while IFS= read -r -d '' meta && IFS= read -r -d '' path; do
+      read -r om nm st <<<"$meta"
+      pin_move_entry "$om" "$nm" "$st" "$path" ||
+        reject "commit $commit changes $path, which is neither a flake.lock nor a submodule pointer"
+    done < <(diff_entries "${ps[0]}" "$commit")
+  done < <(git rev-list --parents "$MB..$HEAD" | awk '{ c = $1; $1 = ""; print c, $0 }')
+fi
+
+# ------------------------------------------------------ submodule pointers
+
+gitmodules_name() { # print the name of the submodule at path $1, from the .gitmodules of the head
+  local entry key value
+  while IFS= read -r -d '' entry; do
+    key=${entry%%$'\n'*}
+    value=${entry#*$'\n'}
+    if [ "$value" = "$1" ]; then
+      key=${key#submodule.}
+      printf '%s\n' "${key%.path}"
+      return 0
+    fi
+  done < <(git config --blob "$HEAD:.gitmodules" -z --get-regexp '^submodule\..*\.path$' 2>/dev/null)
+  return 1
+}
+
+for ((i = 0; i < ${#LINKS[@]}; i += 2)); do
+  st=${LINKS[i]} path=${LINKS[i + 1]}
+  label="submodule $path"
+  [ "$(mode_at "$HEAD" "$path")" = 160000 ] || continue
+  new=$(blob_at "$HEAD" "$path")
+  old=""
+  if [ "$st" != A ] && [ "$(mode_at "$MB" "$path")" = 160000 ]; then
+    old=$(blob_at "$MB" "$path")
+    $PIN_MOVE || {
+      reject "$label moves from $old to $new; pull requests carry no pointer moves, which convergence makes"
+      continue
+    }
+  fi
+  if $PIN_MOVE && [ -z "$old" ]; then
+    reject "a pin move adds $label"
+    continue
+  fi
+  name=$(gitmodules_name "$path") || {
+    reject "$label has no entry in .gitmodules"
+    continue
+  }
+  url=$(git config --blob "$HEAD:.gitmodules" "submodule.$name.url" 2>/dev/null || true)
+  branch=$(git config --blob "$HEAD:.gitmodules" "submodule.$name.branch" 2>/dev/null || true)
+  if [ "$branch" = . ]; then
+    reject "$label tracks the superproject's branch (branch = .), which this check does not resolve"
+    continue
+  fi
+  furl=$(fetch_url "$url") || {
+    reject "$label has URL $url, which is not an https or local URL"
+    continue
+  }
+  on_tracked_ref "$label" "$furl" "${branch:-HEAD}" "$new" "$old" || true
+done
+
+# ------------------------------------------------------------- lock files
+
+# The lock of a flake that had none at the merge base.
+EMPTY_LOCK='{"nodes":{"root":{}},"root":"root","version":7}'
+
+for lock in ${LOCKS[@]+"${LOCKS[@]}"}; do
+  head_json=$TMP/head.json base_json=$TMP/base.json
+  git show "$HEAD:$lock" >"$head_json"
+  if [ -n "$(blob_at "$MB" "$lock")" ]; then
+    git show "$MB:$lock" >"$base_json"
+  else
+    printf '%s\n' "$EMPTY_LOCK" >"$base_json"
+  fi
+  if ! jq -e 'type == "object" and (.nodes | type) == "object" and (.root | type) == "string" and (.nodes[.root] | type) == "object"' "$head_json" >/dev/null 2>&1; then
+    reject "$lock is not a flake lock file"
+    continue
+  fi
+  if ! jq -e '.nodes[.root].inputs // {} | type == "object" and (keys | all(test("^[A-Za-z_][A-Za-z0-9_-]*$")))' "$head_json" >/dev/null; then
+    reject "$lock names a root input that is not a plain identifier"
+    continue
+  fi
+
+  overrides=()
+  while IFS= read -r name; do
+    [ -n "$name" ] || continue
+    label="input $name of $lock"
+    pair=$(jq -c -n --arg n "$name" --slurpfile h "$head_json" --slurpfile b "$base_json" '
+      def node($l): ($l.nodes[$l.root].inputs // {})[$n] as $k
+        | if ($k | type) == "string" then $l.nodes[$k] else null end;
+      { h: node($h[0]), b: node($b[0]) }
+      | .kind = (if .h == null then "follows"
+                 elif (.h.locked | type) != "object" then "unlocked"
+                 elif .b == null or .h.original != .b.original then "new"
+                 elif .h.locked == .b.locked then "same"
+                 else "moved" end)')
+    kind=$(jq -r .kind <<<"$pair")
+    case $kind in
+      follows | same) continue ;;
+      unlocked)
+        reject "$label has no locked attributes"
+        continue
+        ;;
+      new)
+        if $PIN_MOVE; then
+          reject "a pin move adds $label, or changes where it comes from"
+          continue
+        fi
+        ;;
+      moved)
+        if ! $PIN_MOVE; then
+          reject "$label moves from $(jq -r '.b.locked.rev // "?"' <<<"$pair") to $(jq -r '.h.locked.rev // "?"' <<<"$pair"); pull requests carry no pin moves, which convergence makes"
+          continue
+        fi
+        ;;
+    esac
+
+    type=$(jq -r '.h.locked.type' <<<"$pair")
+    rev=$(jq -r '.h.locked.rev // ""' <<<"$pair")
+    ref=$(jq -r '.h.original.ref // "HEAD"' <<<"$pair")
+    old=""
+    if [ "$kind" = moved ]; then
+      old=$(jq -r '.b.locked.rev // ""' <<<"$pair")
+      if [ "$(jq -r '.b.locked.type' <<<"$pair")" != "$type" ]; then
+        reject "$label changes type"
+        continue
+      fi
+    fi
+    # The repository comes from `original`, which the regenerated lock
+    # below holds to flake.nix; `locked` must name the same one, since
+    # an override keeps `original` whatever repository it locks.
+    case $type in
+      github)
+        if ! jq -e '.h.original.type == "github" and .h.locked.owner == .h.original.owner and .h.locked.repo == .h.original.repo' <<<"$pair" >/dev/null; then
+          reject "$label locks a commit of another repository than the one it comes from"
+          continue
+        fi
+        owner=$(jq -r '.h.original.owner // ""' <<<"$pair")
+        repo=$(jq -r '.h.original.repo // ""' <<<"$pair")
+        if [[ ! $owner =~ ^[A-Za-z0-9._-]+$ ]] || [[ ! $repo =~ ^[A-Za-z0-9._-]+$ ]] || jq -e '.h.original.host // .h.locked.host' <<<"$pair" >/dev/null; then
+          reject "$label names a GitHub repository this check does not fetch"
+          continue
+        fi
+        url="https://github.com/$owner/$repo.git"
+        ;;
+      git)
+        if ! jq -e '.h.original.type == "git" and .h.locked.url == .h.original.url' <<<"$pair" >/dev/null; then
+          reject "$label locks a commit of another repository than the one it comes from"
+          continue
+        fi
+        if ! url=$(fetch_url "$(jq -r '.h.original.url // ""' <<<"$pair")"); then
+          reject "$label has a URL that is not an https or local URL"
+          continue
+        fi
+        ;;
+      *)
+        if [ "$kind" = moved ]; then
+          reject "$label is a $type input, whose commits this check cannot trace"
+        fi
+        # An added input of another type is fetched again by the lock
+        # below, from the URL in flake.nix, and must match.
+        continue
+        ;;
+    esac
+    if ! is_rev "$rev"; then
+      reject "$label locks no commit hash"
+      continue
+    fi
+    if [ -n "$old" ] && ! is_rev "$old"; then
+      reject "$label moves from something other than a commit hash"
+      continue
+    fi
+    on_tracked_ref "$label" "$url" "$ref" "$rev" "$old" || continue
+    if ! oref=$(locked_ref "$(jq -c '.h.locked' <<<"$pair")" 2>"$TMP/eval.err"); then
+      reject "$label: cannot form a flake reference: $(tail -n 1 "$TMP/eval.err")"
+      continue
+    fi
+    overrides+=(--override-input "$name" "$oref")
+  done < <(jq -r '.nodes[.root].inputs // {} | keys[]' "$head_json")
+
+  # Regenerate the lock from the lock at the merge base, with the
+  # flake.nix of the head and the checked inputs held where the head
+  # locks them.
+  if [ -z "$WT" ]; then
+    WT=$TMP/tree
+    git worktree add --quiet --detach "$WT" "$HEAD" 2>"$TMP/wt.err" || die "cannot check out $HEAD: $(tail -n 1 "$TMP/wt.err")"
+  fi
+  if [ -n "$(blob_at "$MB" "$lock")" ]; then
+    git show "$MB:$lock" >"$WT/$lock"
+  else
+    rm -f "$WT/$lock"
+  fi
+  if ! "${NIX[@]}" flake lock "$WT/$(dirname "$lock")" ${overrides[@]+"${overrides[@]}"} >"$TMP/lock.log" 2>&1; then
+    reject "$lock: nix flake lock fails: $(grep -v '^warning:' "$TMP/lock.log" | tail -n 3)"
+  elif ! cmp -s "$WT/$lock" "$head_json"; then
+    if difference=$(diff -u --label regenerated --label "$lock" <(jq -S . "$WT/$lock") <(jq -S . "$head_json" 2>/dev/null)); then
+      difference="(the JSON values match; the bytes differ)"
+    fi
+    reject "$lock is not what nix flake lock writes:"$'\n'"$(head -n 40 <<<"$difference")"
+  fi
+  git -C "$WT" checkout --quiet "$HEAD" -- "$lock"
+done
+
+if [ "${#PROBLEMS[@]}" -gt 0 ]; then
+  printf 'rejected: %s\n' "${PROBLEMS[@]}"
+  exit 1
+fi
+printf 'accepted: %d lock file(s) and %d submodule pointer(s) changed, all as flake-sync would make them\n' \
+  "${#LOCKS[@]}" "$((${#LINKS[@]} / 2))"
