@@ -48,7 +48,21 @@
 
 set -euo pipefail
 
+build_id() { # "flake-sync <store hash> (<store path>)" for a store build, else the script's path
+  local self store
+  self=$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || echo "${BASH_SOURCE[0]}")
+  case $self in
+    /nix/store/*)
+      store=${self#/nix/store/}
+      store=${store%%/*}
+      echo "flake-sync ${store%%-*} (/nix/store/$store)"
+      ;;
+    *) echo "flake-sync, not a Nix store build ($self)" ;;
+  esac
+}
+
 usage() {
+  build_id
   cat <<'EOF'
 Usage: flake-sync <command> [options]
 
@@ -202,6 +216,8 @@ Options:
                         change what the command operates on
                         (FLAKE_SYNC_UPSTREAM, default
                         github:clhodapp/flake-sync, names the flake)
+      --version         Print the store hash and path of this build (the
+                        first line of this help)
   -h, --help            Show this help
 
 The workspace is found from the current directory: the enclosing git repo,
@@ -1971,6 +1987,7 @@ for arg in "$@"; do
     --all) WITH_PARTITIONS=true WITH_TESTS=true WITH_EXTERNAL=true CHECKOUT_ALL=true ;;
     --latest-flake-sync) ;; # handled before anything else; reaching here means this is that copy
     -h | --help) usage; exit 0 ;;
+    --version) build_id; exit 0 ;;
     -*) die "unknown option '$arg' (see --help)" ;;
     *) if [ -z "$CMD" ]; then CMD=$arg; else ARGS+=("$arg"); fi ;;
   esac

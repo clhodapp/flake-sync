@@ -131,6 +131,7 @@ them.
 ## Stability
 
 flake-sync is a rolling release; commands and flags can change.
+`flake-sync --version` prints the store hash of the running build.
 
 ## License
 

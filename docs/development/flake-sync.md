@@ -453,6 +453,10 @@ the command operates on. `FLAKE_SYNC_UPSTREAM` names another flake to run
 instead. The started copy runs with `FLAKE_SYNC_LATEST_ACTIVE=1`, so it
 ignores the flag rather than starting another.
 
+`flake-sync --version`, and the first line of `--help`, print the store
+hash and path of the running build. A copy run from a checkout instead
+of the store prints its path.
+
 ## Gotchas
 
 - **A detached HEAD blocks the mutating actions.** Submodules checked out by

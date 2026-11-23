@@ -37,6 +37,12 @@ assert_converged() {
   expect_contains "$out" "Converged" "$1"
 }
 
+echo "=== 0. --version names the store build"
+build=$(readlink -f "$FS"); build=${build#/nix/store/}; build=${build%%/*}
+out=$($FS --version)
+[ "$out" = "flake-sync ${build%%-*} (/nix/store/$build)" ] || fail "--version should print the store hash and path, got: $out"
+expect_contains "$($FS --help)" "flake-sync ${build%%-*}" "the help text starts with the build"
+
 echo "=== 1. fresh fixture is converged"
 assert_converged "initial state is converged"
 
