@@ -37,10 +37,10 @@ flake-sync reference.
   lock are converged like those of any other repo, and its submodule
   pointers are bumped last.
 
-Check whether flake-sync is already provided before adding it:
-`command -v flake-sync` shows whether it is on the PATH, and the
-workspace's development shell or the machine's configuration may supply
-it. If nothing does, ask the owner how the workspace should provide it,
+flake-sync may already be available: `command -v flake-sync` shows
+whether it is on the PATH, and the workspace's development shell or the
+machine's configuration may supply it. Only if nothing does, ask the
+owner how the workspace should provide it,
 for example as an input of its development shell, so contributors and
 CI run the same version. Until then,
 `nix run github:clhodapp/flake-sync -- <command>` runs it without
