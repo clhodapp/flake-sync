@@ -6,7 +6,7 @@
 # `issues`. flake-sync-pin-request serve does the work: it moves the
 # inputs, runs `nix flake check` unless the request is signed by a key in
 # the allowed-signers file of the default branch, commits, and pushes to
-# the default branch as the GitHub App. docs/development/flake-sync.md
+# the default branch with a deploy key. docs/development/flake-sync.md
 # (Pin requests) shows the caller.
 
 name: pin-request
@@ -20,12 +20,12 @@ on:
         required: true
       environment:
         description: >-
-          The environment that holds the GitHub App that pushes the move,
-          as the variable PIN_REQUEST_APP_ID and the secret
-          PIN_REQUEST_APP_PRIVATE_KEY. Its deployment branch policy should
-          allow the default branch only, since the App may push past the
-          rulesets of the default branch. The App needs write access to
-          contents.
+          The environment that holds the secret PIN_REQUEST_DEPLOY_KEY,
+          the private half of an SSH deploy key with write access to the
+          repository, which fetches and pushes the move. The rulesets of
+          the default branch must let deploy keys bypass them. The
+          environment's deployment branch policy should allow the default
+          branch only, since the key can push past those rulesets.
         type: string
         default: pin-request
       signers:
@@ -37,7 +37,7 @@ on:
         type: string
         default: ""
     secrets:
-      PIN_REQUEST_APP_PRIVATE_KEY:
+      PIN_REQUEST_DEPLOY_KEY:
         description: Read from the environment; a job in an environment uses the environment's secret of this name.
         required: false
 
@@ -79,33 +79,27 @@ jobs:
             experimental-features = nix-command flakes
             ${{ inputs.extra-nix-config }}
 
-      - name: Mint the App token
-        id: app
-        uses: actions/create-github-app-token@f418cff399f7aef4c2f0ad47e25ca7a6abbdd6fc # v3.4.0
-        with:
-          app-id: ${{ vars.PIN_REQUEST_APP_ID }}
-          private-key: ${{ secrets.PIN_REQUEST_APP_PRIVATE_KEY }}
-          permission-contents: write
-
       # A retry runs the check again after the default branch moved, so
-      # the token exists while builds run. It stays out of the
-      # environment: a file only the runner user reads, which git gets
-      # through a credential helper. The builds of the check run as the
-      # build users of the Nix daemon.
-      - name: Give the token to git
+      # the deploy key exists while builds run. It stays out of the
+      # environment of the steps: a file only the runner user reads,
+      # which git's ssh gets through core.sshCommand. The builds of the
+      # check run as the build users of the Nix daemon. GitHub's host
+      # keys come from its API, over TLS.
+      - name: Give the deploy key to git
         env:
-          TOKEN: ${{ steps.app.outputs.token }}
+          KEY: ${{ secrets.PIN_REQUEST_DEPLOY_KEY }}
+          REPO: ${{ github.repository }}
         run: |
+          if [[ -z $KEY ]]; then
+            echo "::error::The environment holds no secret PIN_REQUEST_DEPLOY_KEY."
+            exit 1
+          fi
           umask 077
-          printf '%s' "$TOKEN" > "$RUNNER_TEMP/push-token"
-          cat > "$RUNNER_TEMP/git-credential-push" <<EOF
-          #!/bin/sh
-          [ "\$1" = get ] || exit 0
-          echo username=x-access-token
-          printf 'password=%s\n' "\$(cat '$RUNNER_TEMP/push-token')"
-          EOF
-          chmod 700 "$RUNNER_TEMP/git-credential-push"
-          git config --local credential.helper "$RUNNER_TEMP/git-credential-push"
+          printf '%s\n' "$KEY" > "$RUNNER_TEMP/deploy-key"
+          curl -sSf https://api.github.com/meta | jq -r '.ssh_keys[] | "github.com " + .' > "$RUNNER_TEMP/known_hosts"
+          git remote set-url origin "git@github.com:$REPO.git"
+          git config --local core.sshCommand \
+            "ssh -i $RUNNER_TEMP/deploy-key -o IdentitiesOnly=yes -o UserKnownHostsFile=$RUNNER_TEMP/known_hosts -o StrictHostKeyChecking=yes"
 
       - name: Carry out the request
         id: serve
@@ -133,7 +127,7 @@ jobs:
           MESSAGE: ${{ steps.serve.outputs.message }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
-          rm -f "$RUNNER_TEMP/push-token"
+          rm -f "$RUNNER_TEMP/deploy-key"
           case $RESULT in
             pushed | unchanged)
               printf '%s\n' "$MESSAGE" > "$RUNNER_TEMP/answer"

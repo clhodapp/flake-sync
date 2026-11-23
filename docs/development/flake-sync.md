@@ -302,16 +302,19 @@ jobs:
       flake-sync: <commit>
 ```
 
-A GitHub App pushes the move, so it needs write access to contents,
-and the rulesets of the default branch must list it as a bypass actor.
-Its ID and private key are the variable `PIN_REQUEST_APP_ID` and the
-secret `PIN_REQUEST_APP_PRIVATE_KEY` of the environment `pin-request`
-(the input `environment` names another). The environment's deployment
+A deploy key fetches and pushes the move: an SSH key with write
+access to this repository alone. Its private half is the secret
+`PIN_REQUEST_DEPLOY_KEY` of the environment `pin-request` (the input
+`environment` names another), and the rulesets of the default branch
+must list deploy keys as a bypass actor. The environment's deployment
 branch policy should allow the default branch only: a repository
-secret is readable by a workflow on any branch, and this App pushes
-past the rulesets. A push
-by an App starts the workflows that the push triggers, as a push by the
-workflow's `GITHUB_TOKEN` does not. The workflow answers on the issue
+secret is readable by a workflow on any branch, and the key pushes
+past the rulesets. Make one with
+`ssh-keygen -t ed25519 -N '' -C 'flake-sync pin-request' -f key`, add
+`key.pub` as a deploy key with write access, store `key` as the secret,
+and delete both files. A push
+with the key starts the workflows that the push triggers, as a push
+by the workflow's `GITHUB_TOKEN` does not. The workflow answers on the issue
 with the commit and closes it, or comments why the request was refused
 or the check failed and leaves it open; reopening it runs the request
 again. `tests/vm/pin-request.sh` holds a scenario for each kind of
