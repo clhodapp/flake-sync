@@ -60,13 +60,15 @@ version:
 }
 ```
 
-The `flake-sync-skills` package holds agent skills for working in a
-flake-sync workspace (`flake-sync-workspaces`, `flake-sync-pull-requests`,
-`flake-sync-converge`), one directory per skill with a `SKILL.md` and the
-reference beside it, in the Agent Skills format, for any agent that
-reads skills from a directory. The skills describe the commands; a
-workspace's instructions for agents and contributors say when to use
-them.
+The `flake-sync-skills` package holds agent skills for setting up and
+working in a flake-sync workspace (`flake-sync-new-workspace`,
+`flake-sync-workspaces`, `flake-sync-pull-requests`,
+`flake-sync-converge`), one directory per skill with a `SKILL.md` and
+the reference beside it, in the Agent Skills format, for any agent that
+reads skills from a directory. The skills explain how the workspace and
+the commands work; a workspace's instructions for agents and
+contributors say when to use them, and `flake-sync-new-workspace` walks
+through settling those instructions with the workspace's owner.
 
 `nix profile install github:clhodapp/flake-sync` puts it on `PATH`
 permanently. The package carries every program it runs, `git`, `nix`

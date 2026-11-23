@@ -12,6 +12,7 @@ let
     "flake-sync-workspaces"
     "flake-sync-pull-requests"
     "flake-sync-converge"
+    "flake-sync-new-workspace"
   ];
 in
 runCommand "flake-sync-skills"
