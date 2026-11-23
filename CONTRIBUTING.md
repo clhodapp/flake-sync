@@ -28,8 +28,25 @@
   tree, so an untracked file is invisible to the build.
 - Write commit messages with a `type: summary` first line (`feat`, `fix`,
   `maint`, `docs`, `refactor`), in the present tense, with a body saying
-  why when the change is not self-evident. Rebase; do not merge.
-- Run `nix flake check` before opening a pull request.
+  why when the change is not self-evident.
+
+## Issues
+
+File bugs and requests at
+[github.com/clhodapp/flake-sync/issues](https://github.com/clhodapp/flake-sync/issues).
+For a bug, include the output of `flake-sync --version`, the command you
+ran, its output, and what you expected instead. For a request, describe
+the workspace situation it is for.
+
+## Pull requests
+
+- Fork the repo and branch from `main`; keep a pull request to one change.
+- Run `nix flake check` before opening it. CI runs it again on the pull
+  request.
+- In the description, say what changes and why, and name the scenario
+  that covers a change in behavior.
+- When `main` moves, rebase the branch onto it; do not merge `main` into
+  the branch.
 
 ## Checks
 
