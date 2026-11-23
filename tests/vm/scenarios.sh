@@ -960,4 +960,123 @@ echo "ok: CI pushes pin commits directly"
 git config --global --unset "url.file://$gh2/hub/.insteadOf"
 unset FLAKE_SYNC_GH
 
+echo "=== 26. pr opens a draft until the change can merge, then takes it out of draft"
+g3=$(mktemp -d)
+mkdir -p "$g3/hub" "$g3/fake"
+git config --global "url.file://$g3/hub/.insteadOf" "git@github.com:t3/"
+for r in one two ws3; do git init -q --bare "$g3/hub/$r.git"; done
+git clone -q "$g3/hub/one.git" "$g3/one-src"
+echo '{ outputs = _: { }; }' >"$g3/one-src/flake.nix"
+git -C "$g3/one-src" add flake.nix
+git -C "$g3/one-src" commit -qm "init one"
+git -C "$g3/one-src" push -q origin main
+lock_on() { # a flake.lock that pins one at rev $1
+  jq -n --arg rev "$1" '{nodes: {one: {locked: {type: "github", owner: "t3", repo: "one", rev: $rev}}, root: {inputs: {one: "one"}}}, root: "root", version: 7}'
+}
+git clone -q "$g3/hub/two.git" "$g3/two-src"
+echo '{ inputs.one.url = "github:t3/one"; outputs = _: { }; }' >"$g3/two-src/flake.nix"
+lock_on "$(git --git-dir="$g3/hub/one.git" rev-parse main)" >"$g3/two-src/flake.lock"
+git -C "$g3/two-src" add flake.nix flake.lock
+git -C "$g3/two-src" commit -qm "init two"
+git -C "$g3/two-src" push -q origin main
+git init -q "$g3/ws3"
+git -C "$g3/ws3" remote add origin git@github.com:t3/ws3.git
+git -C "$g3/ws3" submodule -q add git@github.com:t3/one.git projects/one
+git -C "$g3/ws3" submodule -q add git@github.com:t3/two.git projects/two
+git -C "$g3/ws3" commit -qm "init ws3"
+git -C "$g3/ws3" push -q -u origin main
+for r in one two; do
+  git -C "$g3/ws3/projects/$r" checkout -q -b change
+  echo change >"$g3/ws3/projects/$r/change.txt"
+  git -C "$g3/ws3/projects/$r" add change.txt
+  git -C "$g3/ws3/projects/$r" commit -qm "feat: change $r"
+done
+# A stand-in for gh that keeps each pull request's state in a file.
+cat >"$g3/fake/gh" <<'FAKE'
+#!/usr/bin/env bash
+echo "$*" >>"$FAKE_GH_DIR/log"
+repo="" head="" draft=no url=""
+args=("$@")
+for ((i = 0; i < ${#args[@]}; i++)); do
+  case ${args[i]} in
+    -R) repo=${args[i+1]#t3/} ;;
+    --head) head=${args[i+1]} ;;
+    --draft) draft=yes ;;
+    https://*) url=${args[i]} ;;
+  esac
+done
+state() { echo "$FAKE_GH_DIR/pr-${1##*/pull/}"; }
+case "$1 $2" in
+  "pr list") f=$FAKE_GH_DIR/by-head-$repo-$head; [ -f "$f" ] && cat "$(state "$(cat "$f")")" ;;
+  "pr create")
+    url=https://github.com/t3/$repo/pull/$repo
+    echo "$url $([ $draft = yes ] && echo DRAFT || echo OPEN)" >"$(state "$url")"
+    echo "$url" >"$FAKE_GH_DIR/by-head-$repo-$head"
+    echo "$url" ;;
+  "pr ready")
+    case " $* " in *" --undo "*) s=DRAFT ;; *) s=OPEN ;; esac
+    echo "$url $s" >"$(state "$url")" ;;
+esac
+FAKE
+chmod +x "$g3/fake/gh"
+export FLAKE_SYNC_GH=$g3/fake/gh FAKE_GH_DIR=$g3/fake
+echo "the body" >"$g3/body"
+pr_state() { cat "$g3/fake/pr-$1" | cut -d' ' -f2; }
+out=$(cd "$g3/ws3" && "$FS" --fetch pr two --title="Change two" --body-file="$g3/body" 2>&1) || { printf 'output was:\n%s\n' "$out" >&2; fail "pr two"; }
+[ "$(pr_state two)" = DRAFT ] || fail "two waits on one, so its pull request is a draft"
+grep -q -- "status: dependencies not ready (waiting on one to merge)" "$g3/fake/log" || fail "the body should say why it is a draft"
+out=$(cd "$g3/ws3" && "$FS" --fetch pr one --title="Change one" --body-file="$g3/body" 2>&1) || { printf 'output was:\n%s\n' "$out" >&2; fail "pr one"; }
+[ "$(pr_state one)" = OPEN ] || fail "one depends on nothing listed, so its pull request is ready"
+echo "ok: the dependency opens for review and the consumer as a draft"
+# one merges.
+git --git-dir="$g3/hub/one.git" update-ref refs/heads/main "$(git --git-dir="$g3/hub/one.git" rev-parse change)"
+(cd "$g3/ws3" && "$FS" --fetch pr two --title="Change two" --body-file="$g3/body") >/dev/null 2>&1 || fail "pr two after one merged"
+[ "$(pr_state two)" = DRAFT ] || fail "two stays a draft until its main pins the merged one"
+grep -q -- "status: waiting for convergence" "$g3/fake/log" || fail "the status should say it waits for convergence"
+# Convergence: two's main pins the merged one.
+git -C "$g3/two-src" pull -q
+lock_on "$(git --git-dir="$g3/hub/one.git" rev-parse main)" >"$g3/two-src/flake.lock"
+git -C "$g3/two-src" commit -qam "maint: update flake pins (one)"
+git -C "$g3/two-src" push -q origin main
+(cd "$g3/ws3" && "$FS" --fetch pr two --title="Change two" --body-file="$g3/body") >/dev/null 2>&1 || fail "pr two after convergence"
+[ "$(pr_state two)" = DRAFT ] || fail "two stays a draft until it is rebased onto the converged main"
+grep -q -- "status: needs a rebase onto main" "$g3/fake/log" || fail "the status should ask for a rebase"
+(cd "$g3/ws3" && "$FS" rebase two) >/dev/null 2>&1 || fail "flake-sync rebase two"
+(cd "$g3/ws3" && "$FS" --fetch pr two --title="Change two" --body-file="$g3/body") >/dev/null 2>&1 || fail "pr two after the rebase"
+[ "$(pr_state two)" = OPEN ] || fail "two should leave draft once rebased onto the converged main"
+echo "ok: the consumer leaves draft once its dependency merged, its main converged, and it is rebased"
+git config --global --unset "url.file://$g3/hub/.insteadOf"
+unset FLAKE_SYNC_GH
+
+echo "=== 27. rebase resolves a flake.lock conflict from the default branch, keeping the inputs the branch adds"
+$FS --heads pull >/dev/null 2>&1 || fail "test setup: pull --heads"
+$FS --fetch converge >/dev/null 2>&1 || fail "test setup: converge"
+# The branch also locks lib at an intermediate pushed commit, so its lock
+# and main's lock both change the lib node and the rebase conflicts.
+echo intermediate >projects/lib/intermediate.txt
+git -C projects/lib add intermediate.txt
+git -C projects/lib commit -qm "feat: lib at an intermediate commit"
+git -C projects/lib push -q origin main
+git -C projects/app checkout -q -b add-input
+sed -i "1a\\  inputs.extra.url = \"git+file://$HUB/extdep.git\";" projects/app/flake.nix
+nix flake lock "$PWD/projects/app" >/dev/null 2>"$WORK/../extra-lock.err" || { cat "$WORK/../extra-lock.err" >&2; fail "test setup: locking the extra input"; }
+nix flake update lib --flake "$PWD/projects/app" >/dev/null 2>"$WORK/../extra-lock.err" || { cat "$WORK/../extra-lock.err" >&2; fail "test setup: moving lib on the branch"; }
+git -C projects/app commit -qam "feat: add the extra input"
+git -C projects/app checkout -q main
+# Meanwhile lib moves and convergence re-pins app's main.
+echo rebase >projects/lib/rebase.txt
+git -C projects/lib add rebase.txt
+git -C projects/lib commit -qm "feat: lib moves before the rebase"
+$FS --fetch converge >/dev/null 2>&1 || fail "converge should re-pin app's main"
+git -C projects/app checkout -q add-input
+out=$($FS --fetch rebase app 2>&1) || { printf 'output was:\n%s\n' "$out" >&2; fail "rebase app"; }
+expect_contains "$out" "resolved flake.lock in app" "rebase resolves the lock conflict"
+[ ! -d "$(git -C projects/app rev-parse --git-path rebase-merge)" ] || fail "the rebase should be finished"
+git -C projects/app merge-base --is-ancestor origin/main HEAD || fail "the branch should sit on the converged main"
+[ "$(lock_rev projects/app lib)" = "$(hub_rev lib)" ] || fail "the lock should keep main's lib pin"
+[ "$(jq -r '.nodes.root.inputs.extra // empty' projects/app/flake.lock)" != "" ] || fail "the lock should keep the input the branch adds"
+echo "ok: rebase keeps the default branch's pins and the branch's new input"
+git -C projects/app checkout -q main
+git -C projects/app branch -q -D add-input
+
 echo "ALL SCENARIOS PASSED"

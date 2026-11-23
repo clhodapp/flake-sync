@@ -84,6 +84,19 @@ Commands:
               other than that dependency's remote default head. "ready":
               neither; its pull request can leave draft. --json prints
               the same as a JSON array
+  pr <repo> --title=<title> --body-file=<file>
+              Push <repo>'s topic branch and open or update its pull
+              request (GitHub remotes), assigned to the gh user. It is a
+              draft, its body led by a "status:" line saying why, until
+              unmerged-commits calls the repo ready and the branch sits
+              on the remote default branch; then it is opened, or taken
+              out of draft. A merged pull request is refused
+  rebase <repo>
+              Rebase <repo>'s topic branch onto its remote default
+              branch. A flake.lock conflict takes the default branch's
+              lock, whose pins are converged, then nix flake lock adds
+              the inputs the branch adds; a conflict in any other file
+              stops for resolution by hand
   checkout <repo>... | --all
               Clone the named submodules that are not checked out here,
               or with --all every one, and attach each to its default
@@ -1071,7 +1084,18 @@ do_push() {
   local repo=$1 dir=${DIR[$1]}
   ! $LOCAL || die "push is publication; --local touches working trees only"
   [ "${BRANCH[$repo]}" != "(detached)" ] || die "$repo is on a detached HEAD"
-  [ "${BEHIND[$repo]}" = 0 ] || die "$repo is behind upstream; pull/rebase first"
+  local default_branch
+  default_branch=$(git -C "$dir" symbolic-ref --quiet --short refs/remotes/origin/HEAD || echo origin/main)
+  default_branch=${default_branch#origin/}
+  local force=()
+  if [ "${BRANCH[$repo]}" = "$default_branch" ]; then
+    [ "${BEHIND[$repo]}" = 0 ] || die "$repo is behind upstream; pull/rebase first"
+  else
+    # A topic branch is rebased onto its default branch, so its push may
+    # replace the remote tip, as long as that tip is part of the local
+    # branch's history (its reflog included).
+    force=(--force-with-lease --force-if-includes)
+  fi
   if $LINKED; then
     # A topic branch goes to GitHub only once what it builds against is
     # there: no repo it depends on may hold unpushed commits.
@@ -1094,7 +1118,7 @@ do_push() {
   fi
   local args=()
   [ "${HAS_UPSTREAM[$repo]}" = yes ] || args=(-u origin "${BRANCH[$repo]}")
-  if ! run git -C "$dir" push --quiet "${args[@]}"; then
+  if ! run git -C "$dir" push --quiet ${force[@]+"${force[@]}"} ${args[@]+"${args[@]}"}; then
     # Most likely the remote moved while we worked (another checkout or
     # session pushed). Refresh our remote-tracking refs so status/plan report
     # "behind upstream" truthfully, then leave the rebase to the user.
@@ -1813,6 +1837,92 @@ cmd_unmerged_commits() { # repos whose branch holds commits besides pin updates 
   fi
 }
 
+cmd_pr() { # open or update the pull request of repo $1's branch, a draft until the change can merge
+  local repo="" title="" bodyfile="" arg
+  for arg in "$@"; do
+    case $arg in
+      --title=*) title=${arg#--title=} ;;
+      --body-file=*) bodyfile=${arg#--body-file=} ;;
+      -*) die "pr takes <repo> --title=<title> --body-file=<file>" ;;
+      *) [ -z "$repo" ] || die "pr takes one repo"; repo=$arg ;;
+    esac
+  done
+  [ -n "$repo" ] && [ -n "$title" ] && [ -n "$bodyfile" ] || die "pr takes <repo> --title=<title> --body-file=<file>"
+  [ -f "$bodyfile" ] || die "no body file $bodyfile"
+  [ -n "${DIR[$repo]:-}" ] || die "$repo is not checked out here"
+  local slug=${SLUG[$repo]:-} dir=${DIR[$repo]} branch=${BRANCH[$repo]} base
+  [ -n "$slug" ] || die "$repo has no GitHub remote to open a pull request on"
+  base=$(default_ref "$repo")
+  [ "$branch" != "(detached)" ] && [ "$branch" != "${base#origin/}" ] \
+    || die "$repo must be on a topic branch to open a pull request"
+  local info state deps existing
+  info=$(cmd_unmerged_commits --json | jq -c --arg r "$repo" '.[] | select(.repo == $r)')
+  [ -n "$info" ] || die "$repo has no unmerged commits besides pin updates"
+  state=$(jq -r .state <<<"$info")
+  deps=$(jq -r '.dependsOn | join(", ")' <<<"$info")
+  existing=$("$GH" pr list -R "$slug" --head "$branch" --state all --json number,state,isDraft,url \
+    --jq 'first // empty | "\(.url) \(if .isDraft then "DRAFT" else .state end)"' 2>/dev/null || true)
+  case $existing in *" MERGED") die "the pull request of $branch is merged (${existing% *}); it takes no new commits" ;; esac
+  # The status line says why a pull request stays a draft.
+  local status=""
+  case $state in
+    "dependencies not ready") status="status: dependencies not ready (waiting on $deps to merge)" ;;
+    "waiting for convergence") status="status: waiting for convergence (the default branch does not pin the merged dependencies yet)" ;;
+    *) git -C "$dir" merge-base --is-ancestor "$base" HEAD \
+         || status="status: needs a rebase onto ${base#origin/} (flake-sync rebase $repo)" ;;
+  esac
+  local body
+  body=$(cat "$bodyfile")
+  [ -z "$status" ] || body=$(printf '%s\n\n%s\n' "$status" "$body")
+  do_push "$repo"
+  if [ -z "$existing" ]; then
+    local draft=()
+    [ -z "$status" ] || draft=(--draft)
+    run "$GH" pr create -R "$slug" --base "${base#origin/}" --head "$branch" --title "$title" --body "$body" \
+      --assignee @me ${draft[@]+"${draft[@]}"} || die "opening the pull request for $repo failed"
+  else
+    run "$GH" pr edit -R "$slug" "${existing% *}" --title "$title" --body "$body" || die "updating ${existing% *} failed"
+    if [ -z "$status" ] && [ "${existing##* }" = DRAFT ]; then
+      run "$GH" pr ready -R "$slug" "${existing% *}" || die "marking ${existing% *} ready failed"
+    elif [ -n "$status" ] && [ "${existing##* }" = OPEN ]; then
+      run "$GH" pr ready -R "$slug" "${existing% *}" --undo || die "returning ${existing% *} to draft failed"
+    fi
+  fi
+  if [ -n "$status" ]; then echo "${C_YLW}$repo: draft pull request; $status${C_OFF}"; else echo "${C_GRN}$repo: pull request ready for review${C_OFF}"; fi
+}
+
+cmd_rebase() { # rebase repo $1's topic branch onto its remote default branch, keeping that branch's pins
+  [ $# -eq 1 ] || die "rebase takes one repo"
+  local repo=$1
+  [ -n "${DIR[$repo]:-}" ] || die "$repo is not checked out here"
+  local dir=${DIR[$repo]} base branch=${BRANCH[$repo]}
+  base=$(default_ref "$repo")
+  [ "$branch" != "(detached)" ] && [ "$branch" != "${base#origin/}" ] || die "$repo must be on a topic branch to rebase it"
+  [ -z "${DIRTY[$repo]}" ] && [ "${LOCK_DIRTY[$repo]}" = no ] || die "$repo has uncommitted changes; commit or discard them first"
+  run git -C "$dir" fetch --quiet origin || die "fetching $repo failed"
+  $DRY_RUN && { echo "+ git -C $dir rebase $base, resolving flake.lock conflicts from $base"; return 0; }
+  git -C "$dir" -c core.editor=true rebase --quiet --empty=drop "$base" >/dev/null 2>&1 && {
+    echo "${C_GRN}rebased $repo ($branch) onto $base${C_OFF}"; return 0; }
+  # Conflicts: a lock takes the default branch's version, whose pins are
+  # converged, and nix flake lock adds what the branch's flake.nix adds.
+  # Any other conflicted file stops the rebase for resolution by hand.
+  local file other locks
+  while [ -d "$(git -C "$dir" rev-parse --git-path rebase-merge)" ] || [ -d "$(git -C "$dir" rev-parse --git-path rebase-apply)" ]; do
+    other=$(git -C "$dir" diff --name-only --diff-filter=U | grep -v -e '^flake\.lock$' -e '/flake\.lock$' || true)
+    [ -z "$other" ] || die "rebasing $repo stopped on conflicts in: $(paste -sd' ' <<<"$other"); resolve them, git rebase --continue, then rerun"
+    locks=$(git -C "$dir" diff --name-only --diff-filter=U)
+    [ -n "$locks" ] || die "rebasing $repo stopped without a conflicted file; see git -C ${dir#"$ROOT"/} status"
+    for file in $locks; do
+      git -C "$dir" checkout --ours -- "$file"
+      nix flake lock "$dir/$(dirname "$file")" >/dev/null 2>&1 || die "nix flake lock failed for $repo:$(dirname "$file") during the rebase"
+      git -C "$dir" add -- "$file"
+    done
+    echo "resolved ${locks//$'\n'/ } in $repo from $base"
+    GIT_EDITOR=true git -C "$dir" rebase --continue >/dev/null 2>&1 || true
+  done
+  echo "${C_GRN}rebased $repo ($branch) onto $base${C_OFF}"
+}
+
 cmd_graph() {
   local repo dep
   echo "topological order (dependencies first):"
@@ -1839,7 +1949,7 @@ for arg in "$@"; do
     --local) LOCAL=true ;;
     --checkout-missing) CHECKOUT_MISSING=true ;;
     --trust-local-checks) TRUST_LOCAL_CHECKS=true ;;
-    --json) ARGS+=("$arg") ;; # unmerged-commits
+    --json | --title=* | --body-file=*) ARGS+=("$arg") ;; # unmerged-commits, pr
     --with-partitions) WITH_PARTITIONS=true ;;
     --with-tests) WITH_TESTS=true ;;
     --with-external) WITH_EXTERNAL=true ;;
@@ -1899,5 +2009,7 @@ case $CMD in
   check) cmd_check "${ARGS[@]}" ;;
   graph) cmd_graph "${ARGS[@]}" ;;
   unmerged-commits) cmd_unmerged_commits "${ARGS[@]}" ;;
+  pr) cmd_pr "${ARGS[@]}" ;;
+  rebase) cmd_rebase "${ARGS[@]}" ;;
   *) die "unknown command '$CMD' (see --help)" ;;
 esac

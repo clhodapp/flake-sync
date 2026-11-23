@@ -268,6 +268,34 @@ GitHub remote, and one of three states:
 
 The listed order is the order to open and merge the pull requests in.
 
+`pr <repo> --title=<title> --body-file=<file>` pushes the repo's topic
+branch (`step push`'s rules apply) and opens or updates its pull request,
+assigned to the `gh` user. Until `unmerged-commits` calls the repo ready
+and the branch contains the remote default branch, the pull request is a
+draft whose body starts with a `status:` line naming the reason; a later
+`pr` run takes it out of draft once both hold, and returns an open one
+to draft if they stop holding. A merged pull request is refused, since
+it takes no new commits.
+
+`rebase <repo>` brings a topic branch onto the converged default branch
+after its dependencies merge. A `flake.lock` conflict, which only a
+branch that adds or changes inputs has, takes the default branch's lock
+and runs `nix flake lock`, which locks just the inputs the branch's
+`flake.nix` adds; a conflict in any other file stops the rebase for
+resolution by hand. The rebased branch is pushed with
+`--force-with-lease --force-if-includes`: it replaces the remote tip
+only when that tip is part of the local branch's history.
+
+For a change A in repo 1 that change B in repo 2 needs:
+
+1. Develop both on topic branches; build B against A with
+   `nix build $(flake-sync override-inputs --local ./projects/repo-2#…)`.
+2. `pr repo-1 …` opens A for review; `pr repo-2 …` opens B as a draft
+   (dependencies not ready).
+3. A merges; convergence re-pins repo 2's default branch (B shows
+   waiting for convergence until then).
+4. `rebase repo-2`, then `pr repo-2 …` takes B out of draft.
+
 ## Local convergence: check and accelerate, publish nothing
 
 ```sh
