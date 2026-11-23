@@ -115,6 +115,29 @@ flake-sync converge --dry-run   # preview first step + remaining plan
 flake-sync converge             # loop until converged or blocked
 ```
 
+Outside CI, pin commits reach the default branch of a GitHub repo
+through a pull request that holds only them and is merged at once:
+`converge` (and `step push`) pushes them to a `flake-sync/pins-<rev>`
+branch, opens the pull request with `gh`, merges it with the first
+method the repo allows (rebase, squash, merge commit), deletes the
+branch, and moves the local default branch onto the merged result, so
+the next level of the DAG pins the commit that is actually on the
+remote. A default branch ahead with commits other than flake-sync's
+pin and pointer commits is refused, since an immediate merge would skip
+their review. When the merge cannot happen now:
+
+- the default branch moved on the remote: the pull request is closed
+  and the run stops; a rerun recomputes the pins on the new tip;
+- branch protection waits for required checks or reviews: auto-merge is
+  turned on and the run stops; a rerun after the merge continues.
+
+Either way the local default branch is reset to the remote one, so no
+pin commit is stranded locally. `--trust-local-checks` skips the wait:
+it runs `nix flake check` here at the `--check` depth, then merges with
+`gh pr merge --admin`, which needs admin rights on the repo. CI
+convergence (`GITHUB_ACTIONS=true`) and repos without a GitHub remote
+push pin commits directly.
+
 `converge` exits 1 when blockers remain or some pins were held back
 (failing check, unpushed target); that is a report, not a script failure.
 Resolve the listed blockers (commit dirty files, check out a branch, pull,

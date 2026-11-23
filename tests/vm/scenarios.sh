@@ -856,4 +856,90 @@ echo "ok: topic branches push in dependency order and carry no pin moves"
 git worktree remove --force "$wt"
 for s in lib app machines; do git -C "$modules/projects/$s" worktree prune; done
 
+echo "=== 25. outside CI, pin commits reach a GitHub default branch through a pull request merged at once"
+gh2=$(mktemp -d)
+mkdir -p "$gh2/hub" "$gh2/fake"
+git init -q --bare "$gh2/hub/one.git"
+git init -q --bare "$gh2/hub/ws2.git"
+git clone -q "$gh2/hub/one.git" "$gh2/one-src"
+echo '{ outputs = _: { }; }' >"$gh2/one-src/flake.nix"
+git -C "$gh2/one-src" add flake.nix
+git -C "$gh2/one-src" commit -qm "init one"
+git -C "$gh2/one-src" push -q origin main
+# GitHub URLs, redirected to the local hub.
+git config --global "url.file://$gh2/hub/.insteadOf" "git@github.com:test/"
+git init -q "$gh2/ws2"
+git -C "$gh2/ws2" remote add origin git@github.com:test/ws2.git
+git -C "$gh2/ws2" submodule -q add git@github.com:test/one.git projects/one
+git -C "$gh2/ws2" commit -qm "init ws2"
+git -C "$gh2/ws2" push -q -u origin main
+git -C "$gh2/ws2/projects/one" checkout -q main
+# A stand-in for gh: it logs its arguments and merges on the local hub.
+# FAKE_GH_BLOCK makes a merge fail as required checks would, unless it
+# passes --admin.
+cat >"$gh2/fake/gh" <<'FAKE'
+#!/usr/bin/env bash
+echo "$*" >>"$FAKE_GH_DIR/log"
+case "$1 $2" in
+  "api repos/test/one") echo "$FAKE_GH_METHODS" ;;
+  "pr create")
+    while [ $# -gt 0 ]; do [ "$1" = --head ] && echo "$2" >"$FAKE_GH_DIR/head"; shift; done
+    echo "https://github.com/test/one/pull/1" ;;
+  "pr merge")
+    case " $* " in *" --auto "*) exit 0 ;; esac
+    case " $* " in *" --admin "*) ;; *) [ -z "${FAKE_GH_BLOCK:-}" ] || exit 1 ;; esac
+    c=$(mktemp -d)
+    git clone -q "$FAKE_GH_HUB/one.git" "$c"
+    git -C "$c" fetch -q origin "$(cat "$FAKE_GH_DIR/head")"
+    git -C "$c" merge -q --squash FETCH_HEAD
+    git -C "$c" commit -qm "$(git -C "$c" log -1 --format=%s FETCH_HEAD) (#1)"
+    git -C "$c" push -q origin main ;;
+  "pr view") echo BLOCKED ;;
+esac
+FAKE
+chmod +x "$gh2/fake/gh"
+export FLAKE_SYNC_GH=$gh2/fake/gh FAKE_GH_DIR=$gh2/fake FAKE_GH_HUB=$gh2/hub FAKE_GH_METHODS=squash
+pin_commit() { # commit a pin-update-shaped change $1 in one
+  echo "$1" >"$gh2/ws2/projects/one/$1.txt"
+  git -C "$gh2/ws2/projects/one" add "$1.txt"
+  git -C "$gh2/ws2/projects/one" commit -qm "maint: update flake pins ($1)"
+}
+hub_one() { git --git-dir="$gh2/hub/one.git" rev-parse main; }
+pin_commit lib
+pinned=$(head_rev "$gh2/ws2/projects/one")
+out=$(cd "$gh2/ws2" && "$FS" step push one 2>&1) || { printf 'output was:\n%s\n' "$out" >&2; fail "step push one through a pull request"; }
+grep -q -- "pr merge -R test/one https://github.com/test/one/pull/1 --squash" "$gh2/fake/log" || { cat "$gh2/fake/log" >&2; fail "the merge should use the allowed method, squash"; }
+[ "$(git --git-dir="$gh2/hub/one.git" log -1 --format=%s main)" = "maint: update flake pins (lib) (#1)" ] || fail "the pin commit should be merged on the hub"
+[ "$(hub_one)" != "$pinned" ] || fail "test setup: a squash merge makes a new commit"
+[ "$(head_rev "$gh2/ws2/projects/one")" = "$(hub_one)" ] || fail "the local main should move onto the merged commit"
+[ -z "$(git --git-dir="$gh2/hub/one.git" for-each-ref refs/heads/flake-sync)" ] || fail "the pull request branch should be deleted"
+echo "ok: a pin commit is merged through a pull request, and the local main follows the merge"
+echo feature >"$gh2/ws2/projects/one/feature.txt"
+git -C "$gh2/ws2/projects/one" add feature.txt
+git -C "$gh2/ws2/projects/one" commit -qm "feat: not a pin update"
+rc=0; out=$(cd "$gh2/ws2" && "$FS" step push one 2>&1) || rc=$?
+[ "$rc" -ne 0 ] || fail "a main ahead with a non-pin commit should not be pushed through an immediate merge"
+expect_contains "$out" "commits on main that are not flake-sync pin updates" "the refusal names the non-pin commit"
+git -C "$gh2/ws2/projects/one" reset -q --hard origin/main
+pin_commit app
+rc=0; out=$(cd "$gh2/ws2" && FAKE_GH_BLOCK=1 "$FS" step push one 2>&1) || rc=$?
+[ "$rc" -ne 0 ] || fail "a blocked merge should stop the push"
+expect_contains "$out" "auto-merge is on" "a merge blocked by checks turns on auto-merge"
+grep -q -- "--squash --auto" "$gh2/fake/log" || fail "auto-merge should be requested"
+[ "$(head_rev "$gh2/ws2/projects/one")" = "$(hub_one)" ] || fail "the local main should be reset to the remote main"
+echo "ok: a blocked merge waits on auto-merge and leaves no local pin commit"
+pin_commit trusted
+out=$(cd "$gh2/ws2" && FAKE_GH_BLOCK=1 "$FS" --trust-local-checks step push one 2>&1) || { printf 'output was:\n%s\n' "$out" >&2; fail "--trust-local-checks should merge past the blocked checks"; }
+grep -q -- "--squash --admin" "$gh2/fake/log" || fail "--trust-local-checks should merge with --admin"
+[ "$(git --git-dir="$gh2/hub/one.git" log -1 --format=%s main)" = "maint: update flake pins (trusted) (#1)" ] || fail "the trusted pin commit should be merged"
+echo "ok: --trust-local-checks runs the checks here and merges without waiting for CI"
+pin_commit machines
+: >"$gh2/fake/log"
+(cd "$gh2/ws2" && GITHUB_ACTIONS=true "$FS" step push one) >/dev/null 2>&1 || fail "CI should push directly"
+[ "$(hub_one)" = "$(head_rev "$gh2/ws2/projects/one")" ] || fail "CI should push the pin commit to main as it is"
+[ ! -s "$gh2/fake/log" ] || fail "CI should not call gh"
+echo "ok: CI pushes pin commits directly"
+git config --global --unset "url.file://$gh2/hub/.insteadOf"
+unset FLAKE_SYNC_GH
+
 echo "ALL SCENARIOS PASSED"

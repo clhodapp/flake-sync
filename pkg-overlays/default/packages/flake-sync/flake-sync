@@ -139,6 +139,16 @@ Options:
                         agent worktrees. Pins still advance only to pushed
                         sibling revs, so the locks written are exactly the
                         ones CI convergence will commit
+      --trust-local-checks
+                        (converge, step push) Outside CI, pin commits reach a
+                        GitHub default branch through a pull request that
+                        is merged at once; when branch protection makes the
+                        merge wait for required checks, auto-merge is
+                        turned on and the run stops. With this flag the
+                        merge does not wait: nix flake check runs here at
+                        the --check depth, then the pull request merges
+                        with gh's --admin override. FLAKE_SYNC_GH names
+                        the gh executable (default gh)
       --checkout-missing
                         (converge, step) Clone a submodule that is not
                         checked out here when it has a stale pin that can
@@ -208,6 +218,7 @@ DO_FETCH=false
 HEADS=false
 LOCAL=false
 CHECKOUT_MISSING=false
+TRUST_LOCAL_CHECKS=false
 CHECKOUT_ALL=false
 WITH_PARTITIONS=false
 WITH_TESTS=false
@@ -271,6 +282,7 @@ declare -A STALE_PTR=()  # workspace only: lines "repo<TAB>recorded-rev"
 declare -A ABSENT=()     # repo -> path, for a submodule that is not checked out here
 declare -A ABSENTURL=()  # repo -> its remote URL from .gitmodules
 declare -A ABSENTNAME=() # repo -> its submodule name in .gitmodules
+declare -A SLUG=()       # repo -> GitHub owner/repo of its remote, for a GitHub remote
 declare -A ABSENT_READ=() # repo -> 1 once read_absent_state has read it
 declare -A UNCOMMITTED_LOCKS=() # repo -> managed lock paths that differ from HEAD
 declare -A ABSENTBRANCH=() # repo -> its remote's default branch, when known
@@ -307,6 +319,7 @@ discover_repos() {
   WS=${ws_slug##*/}
   [ -n "$WS" ] || WS=$(basename "$ROOT")
   DIR[$WS]=$ROOT
+  [ -z "$ws_slug" ] || SLUG[$WS]=$ws_slug
   local key path url name
   while read -r key path; do
     name=$(basename "$path")
@@ -326,6 +339,7 @@ discover_repos() {
     SUBPATH[$name]=$path
     local slug; slug=$(gh_slug "$url")
     if [ -n "$slug" ]; then
+      SLUG[$name]=$slug
       GH2REPO[$slug]=$name
       PINBASE[$name]="github:$slug"
     else
@@ -982,6 +996,66 @@ do_update_pins() {
   report_held "$repo" "$held_report"
 }
 
+GH=${FLAKE_SYNC_GH:-gh}
+
+push_via_pr() { # put repo $1's commits ahead of origin/$2, all pin commits, on $2 through a pull request merged at once
+  local repo=$1 default=$2 dir=${DIR[$1]} slug=${SLUG[$1]} subject head branch url body
+  subject=$(git -C "$dir" log --format=%s "origin/$default..HEAD" \
+    | grep -v -e '^maint: update flake pins (' -e '^maint: bump ' | head -1 || true)
+  [ -z "$subject" ] || die "$repo has commits on $default that are not flake-sync pin updates (first: '$subject'); a converge outside CI merges only pin updates. Move the other commits to a topic branch and open a pull request for them"
+  head=$(git -C "$dir" rev-parse HEAD)
+  branch=flake-sync/pins-${head:0:12}
+  subject=$(git -C "$dir" log -1 --format=%s HEAD)
+  body=$(printf 'Pin updates from flake-sync converge, merged at once:\n\n%s\n' "$(git -C "$dir" log --format='- %s' "origin/$default..HEAD")")
+  run git -C "$dir" push --quiet origin "HEAD:refs/heads/$branch" || die "pushing $branch of $repo failed"
+  if $DRY_RUN; then
+    echo "${C_BLD}+ $GH pr create -R $slug --base $default --head $branch, then $GH pr merge --rebase${C_OFF}"
+    return 0
+  fi
+  url=$("$GH" pr create -R "$slug" --base "$default" --head "$branch" --title "$subject" --body "$body") \
+    || die "opening the pull request for $branch of $repo failed"
+  # The merge uses the first method the repo allows, in the order rebase,
+  # squash, merge commit; the next level pins whichever commit it puts on
+  # the default branch.
+  local method allowed
+  allowed=$("$GH" api "repos/$slug" --jq '[(if .allow_rebase_merge then "rebase" else empty end), (if .allow_squash_merge then "squash" else empty end), (if .allow_merge_commit then "merge" else empty end)] | join(" ")' 2>/dev/null || echo rebase)
+  method=${allowed%% *}
+  [ -n "$method" ] || method=rebase
+  local merged=false state=MERGED admin=()
+  if $TRUST_LOCAL_CHECKS; then
+    # The checks run here, and the merge overrides the branch protection
+    # that would wait for the remote's CI.
+    local check_flags=(--no-write-lock-file)
+    [ "$CHECK_MODE" = eval ] && check_flags+=(--no-build)
+    run nix flake check "$dir" "${check_flags[@]}" || die "$repo: local nix flake check failed; $url stays open"
+    admin=(--admin)
+  fi
+  if run "$GH" pr merge -R "$slug" "$url" "--$method" ${admin[@]+"${admin[@]}"}; then
+    merged=true
+    run git -C "$dir" push --quiet origin --delete "$branch" || true
+  else
+    state=$("$GH" pr view -R "$slug" "$url" --json mergeStateStatus --jq .mergeStateStatus 2>/dev/null || echo UNKNOWN)
+    case $state in
+      DIRTY | BEHIND)
+        # The default branch moved: a rerun recomputes the pins on it.
+        run "$GH" pr close -R "$slug" "$url" --delete-branch || true ;;
+      *)
+        # Required checks or reviews: GitHub merges once they pass.
+        run "$GH" pr merge -R "$slug" "$url" "--$method" --auto || true ;;
+    esac
+  fi
+  # The local default branch follows the remote: the merge made new
+  # commits, or the pin commit stays in the pull request, or a rerun
+  # recomputes it.
+  run git -C "$dir" fetch --quiet origin
+  run git -C "$dir" reset --quiet --keep "origin/$default" || die "$repo: could not move $default onto origin/$default"
+  $merged || case $state in
+    DIRTY | BEHIND) die "$repo: $default moved on the remote while converging; closed $url, rerun to recompute the pins" ;;
+    *) die "$repo: $url could not be merged now (merge state $state); auto-merge is on, rerun once it merges" ;;
+  esac
+  echo "${C_GRN}merged the pin updates of $repo through $url ($method)${C_OFF}"
+}
+
 do_push() {
   local repo=$1 dir=${DIR[$1]}
   ! $LOCAL || die "push is publication; --local touches working trees only"
@@ -995,6 +1069,17 @@ do_push() {
       [ -n "${DIR[$dep]:-}" ] && [ "${AHEAD[$dep]}" -gt 0 ] && waiting+=("$dep")
     done
     [ ${#waiting[@]} -eq 0 ] || die "$repo depends on ${waiting[*]}, which has unpushed commits; push it first (step push <repo>)"
+  fi
+  # Outside CI, pin commits reach a GitHub default branch through a pull
+  # request merged at once; CI convergence pushes them directly.
+  if [ -n "${SLUG[$repo]:-}" ] && [ "${GITHUB_ACTIONS:-}" != true ]; then
+    local default
+    default=$(git -C "$dir" symbolic-ref --quiet --short refs/remotes/origin/HEAD || echo origin/main)
+    default=${default#origin/}
+    if [ "${BRANCH[$repo]}" = "$default" ]; then
+      push_via_pr "$repo" "$default"
+      return
+    fi
   fi
   local args=()
   [ "${HAS_UPSTREAM[$repo]}" = yes ] || args=(-u origin "${BRANCH[$repo]}")
@@ -1664,6 +1749,7 @@ for arg in "$@"; do
     --heads) HEADS=true ;;
     --local) LOCAL=true ;;
     --checkout-missing) CHECKOUT_MISSING=true ;;
+    --trust-local-checks) TRUST_LOCAL_CHECKS=true ;;
     --with-partitions) WITH_PARTITIONS=true ;;
     --with-tests) WITH_TESTS=true ;;
     --with-external) WITH_EXTERNAL=true ;;
@@ -1681,6 +1767,7 @@ command -v jq >/dev/null || die "jq is required"
 # pull without fetching would sync to yesterday's remote state
 [ "$CMD" != pull ] || DO_FETCH=true
 case $CMD in pull | checkout) ;; *) ! $HEADS || die "--heads applies to pull and checkout only" ;; esac
+! $TRUST_LOCAL_CHECKS || [ "$CHECK_MODE" != none ] || die "--trust-local-checks runs nix flake check here before merging; it needs --check=eval or --check=full"
 [ "$CMD" != checkout ] || ! $CHECKOUT_MISSING || die "--checkout-missing applies to converge, step, next and status"
 
 # checkout needs only the list of submodules and which are checked out.

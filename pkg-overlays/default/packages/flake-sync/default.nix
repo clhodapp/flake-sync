@@ -4,6 +4,7 @@
   writeShellApplication,
   coreutils,
   gawk,
+  gh,
   git,
   gnugrep,
   gnused,
@@ -21,6 +22,7 @@ writeShellApplication {
   runtimeInputs = [
     coreutils
     gawk
+    gh
     git
     gnugrep
     gnused
