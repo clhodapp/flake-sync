@@ -133,9 +133,9 @@ them.
 
 ## Stability
 
-flake-sync is a rolling release: each commit on `main` is a release, and
-commands and flags can change from one to the next. A lock that pins
-flake-sync keeps its commit until the input is updated; `flake-sync
+flake-sync is a rolling release: the head of `main` is the current
+version, and updating a workspace's flake-sync input moves it to that
+head. Commands and flags can change between versions; `flake-sync
 --help` and the reference describe the version in use.
 
 ## License
