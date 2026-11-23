@@ -267,6 +267,7 @@ declare -A STALE_PTR=()  # workspace only: lines "repo<TAB>recorded-rev"
 declare -A ABSENT=()     # repo -> path, for a submodule that is not checked out here
 declare -A ABSENTURL=()  # repo -> its remote URL from .gitmodules
 declare -A ABSENT_READ=() # repo -> 1 once read_absent_state has read it
+declare -A UNCOMMITTED_LOCKS=() # repo -> managed lock paths that differ from HEAD
 declare -A ABSENTBRANCH=() # repo -> its remote's default branch, when known
 TOPO=()
 
@@ -466,17 +467,32 @@ read_lock_pins() { # append sibling-repo (and, with --with-external, external) p
 
 read_pins() { # sibling-repo (+ external, with --with-external) pins from the root lock (+ partition locks with --with-partitions)
   local repo=$1 dir=${DIR[$1]}
-  PINS[$repo]='' DEPS[$repo]='' EXTPINS[$repo]=''
-  read_lock_pins "$repo" "$dir/flake.lock" "."
+  PINS[$repo]='' DEPS[$repo]='' EXTPINS[$repo]='' UNCOMMITTED_LOCKS[$repo]=''
+  read_managed_lock "$repo" flake.lock "."
   if $WITH_PARTITIONS; then
     local sub fd
     while IFS= read -r sub; do
       fd=$(dirname "$sub")
       [ -f "$dir/$fd/flake.nix" ] || continue
-      read_lock_pins "$repo" "$dir/$sub" "$fd"
+      read_managed_lock "$repo" "$sub" "$fd"
     done < <(git -C "$dir" ls-files -- '*/flake.lock')
   fi
   return 0
+}
+
+read_managed_lock() { # pins of lock $2 (path in repo $1) for flake dir $3
+  local repo=$1 path=$2 fd=$3 dir=${DIR[$1]} lock
+  lock=$dir/$path
+  # --local manages the working trees, so it reads their locks. Otherwise
+  # the committed lock is the published state: a pin advanced only in the
+  # working tree is still stale, and update-pins commits it.
+  if ! $LOCAL && git -C "$dir" cat-file -e "HEAD:$path" 2>/dev/null; then
+    ext_tmpdir >/dev/null
+    lock=$EXTTMP/head-$repo-${path//\//_}
+    git -C "$dir" show "HEAD:$path" >"$lock"
+    git -C "$dir" diff --quiet HEAD -- "$path" || UNCOMMITTED_LOCKS[$repo]+="$path "
+  fi
+  read_lock_pins "$repo" "$lock" "$fd"
 }
 
 EXTTMP=
@@ -730,6 +746,13 @@ build_plan() {
     # Everything below plans commits and pushes, that is publication, which --local
     # leaves entirely to CI convergence (or a full local converge).
     $LOCAL && continue
+
+    # A managed lock that differs from HEAD with no pin update planned to
+    # commit it holds changes flake-sync does not make, such as an external
+    # bump without --with-external.
+    if [ -n "${UNCOMMITTED_LOCKS[$repo]:-}" ] && [ -z "$ready" ] && [ -z "$extready" ]; then
+      PLAN+=("BLOCKED|commit|$repo|uncommitted changes in ${UNCOMMITTED_LOCKS[$repo]% } that are not pin updates flake-sync manages; commit or discard them")
+    fi
 
     if [ "$repo" = "$WS" ] && [ -n "${STALE_PTR[$WS]}" ]; then
       local bumpable=() waiting=() sub

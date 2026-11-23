@@ -235,9 +235,15 @@ writes are byte-for-byte what publication will commit. Those dirty locks
 are previews. Discard them with `git checkout -- flake.lock` before
 pulling once the matching pin commit lands remotely, since even an
 identical uncommitted lock blocks a pull; until then, building on them
-is fine. To build against *unpushed* sibling changes, stay with transient
-overrides (`--override-input <dep> path:../<dep>`); `--local` never
-writes an unpushed rev into a lock.
+is fine. A publishing command (`status`, `converge` without `--local`)
+reads pins from the committed locks, so it counts a pin that `--local`
+advanced as stale, and `converge` commits and pushes it. A managed lock
+that still differs from `HEAD` with no pin update planned blocks
+convergence: it holds changes flake-sync does not make, which need a
+commit or a `git checkout` by hand. To build against *unpushed* sibling
+changes, stay with transient overrides
+(`--override-input <dep> path:../<dep>`); `--local` never writes an
+unpushed rev into a lock.
 
 `--local` composes with the rest of the surface: `status --local` reports
 local convergence, `--fetch` refreshes remote refs first so pushed-ness

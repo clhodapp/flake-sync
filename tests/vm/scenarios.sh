@@ -728,10 +728,6 @@ $FS pull >/dev/null
 echo "ok: pull clones a submodule that is registered but not cloned"
 
 echo "=== 22. the other commands treat a submodule that is not checked out as a workspace repo read from its remote"
-# Earlier --local runs leave advanced, uncommitted locks in app and the
-# workspace; the committed locks are the ones an absent app is read from.
-git -C projects/app checkout -q -- flake.lock
-git checkout -q -- flake.lock
 # Scenario 20 moved machines on the hub, past the recorded pointer.
 $FS --heads pull >/dev/null 2>&1 || fail "test setup: pull --heads should sync to the hub tips"
 out=$($FS --fetch converge 2>&1) || { printf 'output was:\n%s\n' "$out" >&2; fail "test setup: the workspace should converge before scenario 22"; }
@@ -790,5 +786,31 @@ git submodule deinit -q -f projects/app projects/machines
 $FS checkout --all >/dev/null
 [ -e projects/app/.git ] && [ -e projects/machines/.git ] || fail "checkout --all should check out every absent submodule"
 assert_converged "checkout --all restores the full checkout"
+
+echo "=== 23. converge commits the pins a --local run advanced, and blocks on other lock changes"
+echo local-then-full >projects/lib/local-then-full.txt
+git -C projects/lib add local-then-full.txt
+git -C projects/lib commit -qm "feat: lib moves before a local run"
+git -C projects/lib push -q origin main
+$FS converge --local >/dev/null 2>&1 || fail "converge --local should advance the working-tree locks"
+[ "$(lock_rev projects/app lib)" = "$(head_rev projects/lib)" ] || fail "test setup: --local should advance app's working-tree lock"
+git -C projects/app diff --quiet HEAD -- flake.lock && fail "test setup: app's lock should be uncommitted after --local"
+out=$($FS status)
+expect_contains "$out" "lib=stale" "status counts a pin advanced only in the working tree as stale"
+$FS converge >/dev/null 2>&1 || fail "converge should commit and push the advanced locks"
+git -C projects/app diff --quiet HEAD -- flake.lock || fail "converge should commit app's advanced lock"
+[ "$(git --git-dir="$HUB/app.git" show main:flake.lock | jq -r '.nodes[.nodes[.root].inputs.lib].locked.rev')" = "$(head_rev projects/lib)" ] \
+  || fail "the hub's app should pin lib's head"
+assert_converged "a full converge after --local publishes the locks"
+# A lock change that is not a pin flake-sync manages blocks, rather than
+# reading as converged.
+stray=$(mktemp)
+jq '.stray = true' projects/app/flake.lock >"$stray"
+cp "$stray" projects/app/flake.lock
+rc=0; out=$($FS converge 2>&1) || rc=$?
+[ "$rc" -ne 0 ] || fail "converge should not report convergence over an uncommitted lock change"
+expect_contains "$out" "commit app: uncommitted changes in flake.lock that are not pin updates flake-sync manages" "the blocker names the lock"
+git -C projects/app checkout -q -- flake.lock
+assert_converged "discarding the change converges again"
 
 echo "ALL SCENARIOS PASSED"
