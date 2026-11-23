@@ -18,10 +18,16 @@ on:
         description: The full hash of the flake-sync commit whose flake-sync-pin-request runs, the same commit the caller names in `uses:`.
         type: string
         required: true
-      app-id:
-        description: The ID of the GitHub App that pushes the move. It needs write access to contents, and the rulesets of the default branch must let it push there.
+      environment:
+        description: >-
+          The environment that holds the GitHub App that pushes the move,
+          as the variable PIN_REQUEST_APP_ID and the secret
+          PIN_REQUEST_APP_PRIVATE_KEY. Its deployment branch policy should
+          allow the default branch only, since the App may push past the
+          rulesets of the default branch. The App needs write access to
+          contents.
         type: string
-        required: true
+        default: pin-request
       signers:
         description: The allowed-signers file, a path in the repository, whose keys may sign requests that skip the check.
         type: string
@@ -31,15 +37,16 @@ on:
         type: string
         default: ""
     secrets:
-      app-private-key:
-        description: The private key of the App named by app-id.
-        required: true
+      PIN_REQUEST_APP_PRIVATE_KEY:
+        description: Read from the environment; a job in an environment uses the environment's secret of this name.
+        required: false
 
 permissions: {}
 
 jobs:
   serve:
     if: startsWith(github.event.issue.title, 'flake-sync update ')
+    environment: ${{ inputs.environment }}
     runs-on: ubuntu-latest
     timeout-minutes: 180
     permissions:
@@ -76,8 +83,8 @@ jobs:
         id: app
         uses: actions/create-github-app-token@f418cff399f7aef4c2f0ad47e25ca7a6abbdd6fc # v3.4.0
         with:
-          app-id: ${{ inputs.app-id }}
-          private-key: ${{ secrets.app-private-key }}
+          app-id: ${{ vars.PIN_REQUEST_APP_ID }}
+          private-key: ${{ secrets.PIN_REQUEST_APP_PRIVATE_KEY }}
           permission-contents: write
 
       # A retry runs the check again after the default branch moved, so

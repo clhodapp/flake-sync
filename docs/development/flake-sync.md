@@ -300,13 +300,16 @@ jobs:
       issues: write
     with:
       flake-sync: <commit>
-      app-id: ${{ vars.PIN_REQUEST_APP_ID }}
-    secrets:
-      app-private-key: ${{ secrets.PIN_REQUEST_APP_PRIVATE_KEY }}
 ```
 
-The App pushes the move, so it needs write access to contents, and the
-rulesets of the default branch must list it as a bypass actor. A push
+A GitHub App pushes the move, so it needs write access to contents,
+and the rulesets of the default branch must list it as a bypass actor.
+Its ID and private key are the variable `PIN_REQUEST_APP_ID` and the
+secret `PIN_REQUEST_APP_PRIVATE_KEY` of the environment `pin-request`
+(the input `environment` names another). The environment's deployment
+branch policy should allow the default branch only: a repository
+secret is readable by a workflow on any branch, and this App pushes
+past the rulesets. A push
 by an App starts the workflows that the push triggers, as a push by the
 workflow's `GITHUB_TOKEN` does not. The workflow answers on the issue
 with the commit and closes it, or comments why the request was refused
