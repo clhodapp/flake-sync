@@ -80,7 +80,11 @@ Commands:
               tip). Every other command reads a submodule that is not
               checked out from its remote: pins onto it are managed, and
               converge bumps its pointer, but advancing the stale pins in
-              its locks needs a checkout (see --checkout-missing)
+              its locks needs a checkout (see --checkout-missing).
+              In a linked worktree of the workspace, the checkout is a
+              linked worktree of the repo the workspace's common git dir
+              keeps for the submodule, on a branch named after the
+              workspace worktree's branch, from origin's tip
   override-inputs <flake-ref>
               Print <flake-ref>, then an `--override-input` flag for every
               input in its lock, at any depth, that pins a workspace repo
@@ -266,6 +270,7 @@ declare -A DEPS=()       # repo -> space-separated dep repo names
 declare -A STALE_PTR=()  # workspace only: lines "repo<TAB>recorded-rev"
 declare -A ABSENT=()     # repo -> path, for a submodule that is not checked out here
 declare -A ABSENTURL=()  # repo -> its remote URL from .gitmodules
+declare -A ABSENTNAME=() # repo -> its submodule name in .gitmodules
 declare -A ABSENT_READ=() # repo -> 1 once read_absent_state has read it
 declare -A UNCOMMITTED_LOCKS=() # repo -> managed lock paths that differ from HEAD
 declare -A ABSENTBRANCH=() # repo -> its remote's default branch, when known
@@ -315,6 +320,8 @@ discover_repos() {
       # and drops it there if it is not a flake.
       ABSENT[$name]=$path
       ABSENTURL[$name]=$url
+      ABSENTNAME[$name]=${key#submodule.}
+      ABSENTNAME[$name]=${ABSENTNAME[$name]%.path}
     fi
     SUBPATH[$name]=$path
     local slug; slug=$(gh_slug "$url")
@@ -1019,8 +1026,14 @@ do_bump_submodules() {
 }
 
 do_checkout() { # clone absent submodule $1 and attach it to its default branch, at origin's tip with $2 = heads, else at the recorded pointer
-  local repo=$1 path=${ABSENT[$1]:-}
+  local repo=$1 path=${ABSENT[$1]:-} gitdir common
   [ -n "$path" ] || die "$repo is already checked out"
+  gitdir=$(git -C "$ROOT" rev-parse --path-format=absolute --git-dir)
+  common=$(git -C "$ROOT" rev-parse --path-format=absolute --git-common-dir)
+  if [ "$gitdir" != "$common" ]; then
+    do_checkout_linked "$repo" "$common"
+    return
+  fi
   run git -C "$ROOT" submodule --quiet update --init -- "$path" || die "cloning $repo failed"
   $DRY_RUN && return 0
   local HEADS=false PULL_SYNCED=0 PULL_HELD=() PULL_NOTES=() # read and written by pull_sub
@@ -1028,6 +1041,37 @@ do_checkout() { # clone absent submodule $1 and attach it to its default branch,
   pull_sub "$path" HEAD
   [ ${#PULL_HELD[@]} -eq 0 ] || die "checked out $repo but could not attach it: ${PULL_HELD[*]}"
   echo "${C_GRN}checked out $repo at $path, on its default branch at $($HEADS && echo "origin's tip" || echo "the recorded pointer")${C_OFF}"
+}
+
+do_checkout_linked() { # in a linked worktree of the workspace, check out absent submodule $1 from the module repo in common git dir $2
+  local repo=$1 common=$2 path=${ABSENT[$1]} module branch start tmp
+  # Every worktree of the workspace shares one repo per submodule, the one
+  # git keeps in the common git dir: objects, refs and fetches are shared,
+  # and each worktree's checkout is a linked worktree of it.
+  module=$common/modules/${ABSENTNAME[$repo]}
+  branch=$(git -C "$ROOT" symbolic-ref --quiet --short HEAD) \
+    || die "the workspace worktree is on a detached HEAD; check out a branch, whose name the submodule branch takes"
+  if [ -d "$module" ]; then
+    run git -C "$module" fetch --quiet origin || echo "${C_YLW}warning: fetch failed for $repo; starting from the refs already fetched${C_OFF}" >&2
+    run git -C "$module" worktree prune
+  else
+    tmp=$(mktemp -d)
+    run git clone --quiet --no-checkout --separate-git-dir="$module" "${ABSENTURL[$repo]}" "$tmp/clone" \
+      || { rm -rf "$tmp"; die "cloning $repo failed"; }
+    rm -rf "$tmp"
+  fi
+  $DRY_RUN && return 0
+  start=$(git -C "$module" symbolic-ref --quiet --short refs/remotes/origin/HEAD || echo origin/main)
+  if git -C "$module" show-ref --verify --quiet "refs/heads/$branch"; then
+    run git -C "$module" worktree add --quiet "$ROOT/$path" "$branch" \
+      || die "checking out the existing branch $branch of $repo failed"
+  else
+    # --no-track: the branch is a topic branch, whose pushes go to a branch
+    # of the same name rather than to the remote default branch.
+    run git -C "$module" worktree add --quiet --no-track -b "$branch" "$ROOT/$path" "$start" \
+      || die "creating branch $branch of $repo failed"
+  fi
+  echo "${C_GRN}checked out $repo at $path, on branch $branch from $start, sharing the workspace's repo for it${C_OFF}"
 }
 
 run_action() {

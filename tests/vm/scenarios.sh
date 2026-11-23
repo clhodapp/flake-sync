@@ -813,4 +813,37 @@ expect_contains "$out" "commit app: uncommitted changes in flake.lock that are n
 git -C projects/app checkout -q -- flake.lock
 assert_converged "discarding the change converges again"
 
+echo "=== 24. in a linked worktree of the workspace, checkout shares the module repos and converge pushes topic branches"
+wt=$(mktemp -d)/wt
+git worktree add -q -b agent-topic "$wt"
+modules=$(git rev-parse --path-format=absolute --git-common-dir)/modules
+out=$(cd "$wt" && "$FS" checkout lib app 2>&1) || { printf 'output was:\n%s\n' "$out" >&2; fail "checkout in a linked worktree"; }
+for s in lib app; do
+  [ "$(cat "$wt/projects/$s/.git")" = "gitdir: $modules/projects/$s/worktrees/$s" ] \
+    || fail "$s should be a linked worktree of the shared module repo, not a clone: $(cat "$wt/projects/$s/.git")"
+  [ "$(git -C "$wt/projects/$s" symbolic-ref --short HEAD)" = agent-topic ] || fail "$s should be on the branch of the workspace worktree"
+  [ "$(head_rev "$wt/projects/$s")" = "$(hub_rev "$s")" ] || fail "$s should start at the hub's main"
+done
+[ ! -d "$(git -C "$wt" rev-parse --path-format=absolute --git-dir)/modules" ] || fail "the linked worktree should hold no private module repos"
+[ "$(git -C projects/lib symbolic-ref --short HEAD)" = main ] || fail "the primary's lib should stay on main"
+echo "ok: checkout in a linked worktree adds linked worktrees of the shared module repos on the worktree's branch"
+echo topic >"$wt/projects/lib/topic.txt"
+git -C "$wt/projects/lib" add topic.txt
+git -C "$wt/projects/lib" commit -qm "feat: lib change on a topic branch"
+rc=0; out=$(cd "$wt" && "$FS" --fetch converge 2>&1) || rc=$?
+[ "$rc" -ne 0 ] || fail "converge should stop on machines, which the worktree does not hold"
+expect_contains "$out" "update-pins machines: stale pins (app,lib) but not checked out here" "the absent machines blocks"
+[ "$(git --git-dir="$HUB/lib.git" rev-parse agent-topic)" = "$(head_rev "$wt/projects/lib")" ] || fail "converge should push lib's topic branch"
+[ "$(git --git-dir="$HUB/lib.git" rev-parse main)" != "$(head_rev "$wt/projects/lib")" ] || fail "converge must not push lib's main"
+[ "$(lock_rev "$wt/projects/app" lib)" = "$(head_rev "$wt/projects/lib")" ] || fail "app should pin lib's topic head"
+[ "$(git --git-dir="$HUB/app.git" rev-parse agent-topic)" = "$(head_rev "$wt/projects/app")" ] || fail "converge should push app's topic branch"
+echo "ok: converge in a linked worktree pushes topic branches and re-pins onto them"
+out=$(cd "$wt" && "$FS" --fetch --checkout-missing converge 2>&1) || { printf 'output was:\n%s\n' "$out" >&2; fail "converge --checkout-missing in a linked worktree"; }
+[ "$(git -C "$wt/projects/machines" symbolic-ref --short HEAD)" = agent-topic ] || fail "machines should be checked out on the topic branch"
+[ "$(git --git-dir="$HUB/workspace.git" rev-parse agent-topic)" = "$(head_rev "$wt")" ] || fail "the workspace topic branch should be pushed"
+[ "$(git --git-dir="$HUB/workspace.git" rev-parse main)" != "$(head_rev "$wt")" ] || fail "the workspace main must not move"
+echo "ok: --checkout-missing in a linked worktree checks out from the shared repo and the whole topic converges"
+git worktree remove --force "$wt"
+for s in lib app machines; do git -C "$modules/projects/$s" worktree prune; done
+
 echo "ALL SCENARIOS PASSED"

@@ -209,6 +209,19 @@ submodule in. `check` skips a repo that is not checked out and names it.
 `pull` is the exception to all of this: it reads only git's registration,
 as described under `pull`.
 
+In a linked worktree of the workspace (`git worktree add`, as agent
+sessions use), `checkout` shares the repo git keeps for each submodule in
+the workspace's common git dir (`.git/modules/<submodule name>`), so a
+submodule is cloned at most once per workspace, and a fetch in any
+worktree serves all of them. It fetches that repo, cloning it there first
+if no checkout has needed it before, and adds the submodule as a linked
+worktree of it. The checkout is on a branch named after the workspace
+worktree's branch, created from `origin`'s default branch tip with no
+upstream, so `converge` in the worktree pushes it as a topic branch of
+the same name. There `converge` commits pin updates on those branches,
+pushes them, and re-pins consumers onto the pushed topic heads; the
+remote default branches do not move.
+
 ## Local convergence: check and accelerate, publish nothing
 
 ```sh
