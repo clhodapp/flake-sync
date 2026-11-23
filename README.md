@@ -60,6 +60,13 @@ version:
 }
 ```
 
+The `flake-sync-skills` package holds agent skills for working in a
+flake-sync workspace (`flake-sync-workspaces`, `flake-sync-pull-requests`,
+`flake-sync-converge`), one directory per skill with a `SKILL.md` and the
+reference beside it, the layout Claude Code, Codex and OpenCode read from
+their skills directories. The skills describe the commands; a
+workspace's CLAUDE.md or contributing docs say when to use them.
+
 `nix profile install github:clhodapp/flake-sync` puts it on `PATH`
 permanently. The package carries every program it runs, `git`, `nix`
 and `gh` included.
