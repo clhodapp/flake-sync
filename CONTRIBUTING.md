@@ -57,6 +57,7 @@ nix build '.#checks.x86_64-linux.flake-sync-package'    # build + shellcheck
 nix build '.#checks.x86_64-linux.treefmt'               # formatting
 nix build '.#checks.x86_64-linux.vm-lifecycle' -L       # the lifecycle test
 nix build '.#checks.x86_64-linux.vm-verify-locks' -L    # the verifier scenarios
+nix build '.#checks.x86_64-linux.vm-pin-request' -L     # the pin request scenarios
 nix fmt                                                 # format the Nix files
 ```
 

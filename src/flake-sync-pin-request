@@ -1,0 +1,284 @@
+#!/usr/bin/env bash
+# SPDX-License-Identifier: MIT
+#
+# Pin requests: GitHub issues that ask CI to move inputs of the root
+# flake.lock of a repository to the tips of their branches. `sign` and
+# `file` make a request; `serve` carries one out in CI.
+# docs/development/flake-sync.md (Pin requests) describes the format and
+# the workflow.
+#
+# `serve` reads the issue title and body, which anyone may write, so it
+# takes only input names from them, checks each against the lock, and
+# writes nothing else of the issue into a commit or a command line. A
+# request skips `nix flake check` only when it carries a valid signature
+# by a key in the allowed-signers file of the default branch.
+
+set -euo pipefail
+
+NAMESPACE=flake-sync-pin-request
+BEGIN='-----BEGIN FLAKE-SYNC PIN REQUEST-----'
+END='-----END FLAKE-SYNC PIN REQUEST-----'
+MAX_HOURS=168
+ATTEMPTS=5
+NAME_RE='^[A-Za-z_][A-Za-z0-9_-]*$'
+REPO_RE='^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+$'
+
+usage() {
+  cat <<'EOF'
+usage:
+  flake-sync-pin-request sign --repo=<owner/name> [--key=<file>] [--expires-in=<hours>] <input>...
+  flake-sync-pin-request file --repo=<owner/name> [--key=<file>] [--expires-in=<hours>] <input>...
+  flake-sync-pin-request serve --repo=<owner/name> --title=<file> --body=<file>
+                               [--signers=<file>] [--issue=<number>]
+
+sign   Print the title and, after a blank line, the body of an issue that
+       asks CI to move the <input>s of the root flake.lock of <owner/name>
+       to the tips of their branches. The body carries the request signed
+       with the SSH key <file> (default: git config user.signingkey); a
+       public key file is signed through ssh-agent. The signature expires
+       after <hours> (default 1, at most 168).
+file   Sign the request and open the issue in <owner/name> with gh.
+serve  Carry out the request whose issue title and body are in the given
+       files, in a checkout of the default branch whose remote origin it
+       pushes to. It moves the inputs with `nix flake update`, runs
+       `nix flake check` unless the request carries a valid signature by a
+       key in <file> (default .github/flake-sync-allowed-signers, read from
+       the checkout), commits flake.lock, and pushes. When the push is
+       refused because the branch moved, it starts again from the new tip.
+       Exits 0 when it pushed or the inputs were already at their tips,
+       1 when the request is refused or the check fails, and 2 on errors.
+       Under GitHub Actions it writes trusted, result, commit and message
+       to $GITHUB_OUTPUT.
+EOF
+}
+
+die() {
+  printf 'flake-sync-pin-request: %s\n' "$*" >&2
+  exit 2
+}
+
+canonical() { # print the names given, sorted and without repeats, on one line
+  printf '%s\n' "$@" | sort -u | paste -sd ' ' -
+}
+
+request_text() { # print the signed text of a request: $1 repository, $2 inputs, $3 expiry
+  printf 'flake-sync pin request\nrepository: %s\ninputs: %s\nexpires: %s\n' "$1" "$2" "$3"
+}
+
+# ------------------------------------------------------------- sign, file
+
+cmd_sign() { # $1 = sign | file; then the options and inputs
+  local mode=$1 repo="" key="" hours=1 arg inputs=() text sig title
+  local sigargs=()
+  shift
+  for arg in "$@"; do
+    case $arg in
+      --repo=*) repo=${arg#*=} ;;
+      --key=*) key=${arg#*=} ;;
+      --expires-in=*) hours=${arg#*=} ;;
+      -*) die "unknown option $arg" ;;
+      *) inputs+=("$arg") ;;
+    esac
+  done
+  [[ $repo =~ $REPO_RE ]] || die "--repo=<owner/name> is required"
+  [ "${#inputs[@]}" -gt 0 ] || die "name at least one input"
+  for arg in "${inputs[@]}"; do
+    [[ $arg =~ $NAME_RE ]] || die "$arg is not an input name"
+  done
+  if [[ ! $hours =~ ^[0-9]+$ ]] || [ "$hours" -lt 1 ] || [ "$hours" -gt "$MAX_HOURS" ]; then
+    die "--expires-in takes 1 to $MAX_HOURS hours"
+  fi
+  tmp=$(mktemp -d)
+  trap 'rm -rf "${tmp:-}"' EXIT
+  if [ -z "$key" ]; then
+    key=$(git config --get user.signingkey) || die "give --key, or set git config user.signingkey"
+  fi
+  case $key in
+    key::*)
+      printf '%s\n' "${key#key::}" >"$tmp/key.pub"
+      key=$tmp/key.pub
+      ;;
+  esac
+  [ -f "$key" ] || die "no key file $key"
+  sigargs=(-Y sign -n "$NAMESPACE" -f "$key")
+  case $key in *.pub) sigargs+=(-U) ;; esac
+  read -ra inputs <<<"$(canonical "${inputs[@]}")"
+  text=$(request_text "$repo" "${inputs[*]}" "$(($(date +%s) + hours * 3600))")
+  sig=$(printf '%s\n' "$text" | ssh-keygen "${sigargs[@]}" 2>"$tmp/err") ||
+    die "ssh-keygen cannot sign: $(tail -n 1 "$tmp/err")"
+  title="flake-sync update ${inputs[*]}"
+  {
+    printf 'A request to move %s to the tips of their branches.\n\n' "${inputs[*]}"
+    # shellcheck disable=SC2016 # the backticks are a Markdown fence
+    printf '```text\n%s\n%s\n%s\n%s\n```\n' "$BEGIN" "$text" "$END" "$sig"
+  } >"$tmp/body"
+  if [ "$mode" = sign ]; then
+    printf '%s\n\n' "$title"
+    cat "$tmp/body"
+  else
+    gh issue create -R "$repo" --title "$title" --body-file "$tmp/body"
+  fi
+}
+
+# ------------------------------------------------------------------ serve
+
+output() { # record $1=$2 for the workflow
+  [ -z "${GITHUB_OUTPUT:-}" ] || printf '%s=%s\n' "$1" "$2" >>"$GITHUB_OUTPUT"
+}
+
+finish() { # $1 exit code, $2 result, $3 message
+  printf '%s\n' "$3"
+  output result "$2"
+  output message "$3"
+  exit "$1"
+}
+
+# Print the signer when body file $4 carries a valid signature over a
+# request for repository $1 and inputs $2 by a key in allowed-signers
+# file $3; otherwise print why not and fail. $5 is a scratch directory.
+signed_by() {
+  local repo=$1 want=$2 signers=$3 body=$4 tmp=$5 principal lines expires now
+  awk -v b="$BEGIN" -v e="$END" '$0 == e { f = 0 } f { print } $0 == b { f = 1 }' "$body" >"$tmp/text"
+  awk '$0 == "-----BEGIN SSH SIGNATURE-----" { f = 1 } f { print } $0 == "-----END SSH SIGNATURE-----" { f = 0 }' "$body" >"$tmp/sig"
+  if [ ! -s "$tmp/text" ] || [ ! -s "$tmp/sig" ]; then
+    echo "the issue carries no signed request"
+    return 1
+  fi
+  if [ ! -f "$signers" ]; then
+    echo "the default branch has no allowed-signers file"
+    return 1
+  fi
+  while IFS= read -r principal; do
+    [ -n "$principal" ] || continue
+    ssh-keygen -Y verify -f "$signers" -I "$principal" -n "$NAMESPACE" -s "$tmp/sig" <"$tmp/text" >/dev/null 2>&1 || continue
+    mapfile -t lines <"$tmp/text"
+    # The repository compares without case, as GitHub names do.
+    if [ "${#lines[@]}" -ne 4 ] || [ "${lines[0]}" != "flake-sync pin request" ] ||
+      [ "${lines[1],,}" != "repository: ${repo,,}" ] || [ "${lines[2]}" != "inputs: $want" ] ||
+      [[ ! ${lines[3]} =~ ^expires:\ ([0-9]{1,12})$ ]]; then
+      echo "the signed request is for another repository or other inputs"
+      return 1
+    fi
+    expires=${BASH_REMATCH[1]}
+    now=$(date +%s)
+    if [ "$expires" -le "$now" ]; then
+      echo "the signed request expired"
+      return 1
+    fi
+    if [ "$expires" -gt $((now + MAX_HOURS * 3600)) ]; then
+      echo "the signed request expires more than $MAX_HOURS hours ahead"
+      return 1
+    fi
+    printf '%s\n' "$principal"
+    return 0
+  done < <(ssh-keygen -Y find-principals -f "$signers" -s "$tmp/sig" 2>/dev/null || true)
+  echo "the signature does not verify with a key that the allowed-signers file accepts for pin requests"
+  return 1
+}
+
+cmd_serve() {
+  local repo="" title_file="" body_file="" signers=.github/flake-sync-allowed-signers issue="" arg
+  for arg in "$@"; do
+    case $arg in
+      --repo=*) repo=${arg#*=} ;;
+      --title=*) title_file=${arg#*=} ;;
+      --body=*) body_file=${arg#*=} ;;
+      --signers=*) signers=${arg#*=} ;;
+      --issue=*) issue=${arg#*=} ;;
+      *) die "unknown argument $arg" ;;
+    esac
+  done
+  [[ $repo =~ $REPO_RE ]] || die "--repo=<owner/name> is required"
+  if [ ! -f "$title_file" ] || [ ! -f "$body_file" ]; then
+    die "--title and --body name the files holding the issue title and body"
+  fi
+  [ -z "$issue" ] || [[ $issue =~ ^[0-9]+$ ]] || die "--issue takes a number"
+  title_file=$(realpath "$title_file")
+  body_file=$(realpath "$body_file")
+
+  local top branch title words inputs=() name list signer reason trusted=false attempt commit
+  local msg=() margs=() m
+  top=$(git rev-parse --show-toplevel 2>/dev/null) || die "not in a git checkout"
+  cd "$top"
+  branch=$(git symbolic-ref --quiet --short HEAD) || die "the checkout is not on a branch"
+  tmp=$(mktemp -d)
+  trap 'rm -rf "${tmp:-}"' EXIT
+  tr -d '\r' <"$body_file" >"$tmp/body"
+
+  title=$(tr -d '\r\n' <"$title_file")
+  if [[ ! $title =~ ^flake-sync\ update(\ [A-Za-z_][A-Za-z0-9_-]*)+$ ]]; then
+    finish 1 refused "The title is not \`flake-sync update <input> ...\` with input names, so the request is not carried out."
+  fi
+  read -ra words <<<"$title"
+  read -ra inputs <<<"$(canonical "${words[@]:2}")"
+  list=$(
+    IFS=,
+    printf '%s' "${inputs[*]}"
+  )
+  [ -f flake.lock ] || finish 1 refused "The default branch has no flake.lock."
+  for name in "${inputs[@]}"; do
+    jq -e --arg n "$name" '(.nodes[.root].inputs // {})[$n] | type == "string"' flake.lock >/dev/null 2>&1 ||
+      finish 1 refused "The root flake.lock locks no input $name."
+  done
+
+  if signer=$(signed_by "$repo" "${inputs[*]}" "$signers" "$tmp/body" "$tmp"); then
+    trusted=true
+    reason="signed by $signer"
+  else
+    reason="$signer; the check runs"
+  fi
+  output trusted "$trusted"
+  printf 'request for %s: %s\n' "${inputs[*]}" "$reason"
+
+  for ((attempt = 1; attempt <= ATTEMPTS; attempt++)); do
+    git fetch --quiet origin "$branch" || die "cannot fetch $branch"
+    git reset --quiet --hard FETCH_HEAD
+    # tarball-ttl 0: the tips as they are now, not as Nix last cached them.
+    nix --extra-experimental-features 'nix-command flakes' --option tarball-ttl 0 \
+      flake update "${inputs[@]}" 2>"$tmp/update.log" ||
+      finish 1 failed "\`nix flake update\` fails: $(grep -v '^warning:' "$tmp/update.log" | tail -n 1)"
+    if git diff --quiet -- flake.lock; then
+      finish 0 unchanged "The inputs $list are already at the tips of their branches."
+    fi
+    if ! $trusted; then
+      if ! nix --extra-experimental-features 'nix-command flakes' flake check --print-build-logs >"$tmp/check.log" 2>&1; then
+        tail -n 40 "$tmp/check.log" >&2
+        finish 1 failed "\`nix flake check\` fails with $list moved, so the move is not pushed."
+      fi
+    fi
+    msg=("maint: update flake pins ($list)")
+    [ -z "$issue" ] || msg+=("Requested-in: #$issue")
+    if $trusted; then
+      msg+=("Checked-by: none, the request is $reason")
+    else
+      msg+=("Checked-by: nix flake check")
+    fi
+    margs=()
+    for m in "${msg[@]}"; do margs+=(-m "$m"); done
+    git add flake.lock
+    git -c commit.gpgsign=false commit --quiet --no-verify "${margs[@]}"
+    commit=$(git rev-parse HEAD)
+    if git push --quiet origin "HEAD:refs/heads/$branch" 2>"$tmp/push.log"; then
+      output commit "$commit"
+      finish 0 pushed "Moved $list in $commit."
+    fi
+    printf 'the push was refused (attempt %d of %d); starting again from the new tip\n' "$attempt" "$ATTEMPTS"
+  done
+  finish 2 failed "The push was refused $ATTEMPTS times."
+}
+
+case ${1:-} in
+  sign | file) cmd_sign "$@" ;;
+  serve)
+    shift
+    cmd_serve "$@"
+    ;;
+  -h | --help)
+    usage
+    exit 0
+    ;;
+  *)
+    usage >&2
+    exit 2
+    ;;
+esac

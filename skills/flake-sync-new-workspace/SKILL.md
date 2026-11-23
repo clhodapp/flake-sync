@@ -79,12 +79,13 @@ Ask these, explain the consequences below, and record the answers.
    worktrees, flake-sync makes pin moves on the default branches, not on
    topic branches; the instructions should say whether agents open pull requests, push
    topic branches only, or stop at local commits.
-7. **Do pull requests need their lock changes verified?** The
-   verify-locks workflow checks that each `flake.lock` change in a pull
-   request is one flake-sync or Nix would write, and can merge or close
-   pin moves (§ Verifying lock changes). It needs a caller workflow in
-   each repo, a GitHub App to post the status, and a ruleset that
-   requires the status from that App.
+7. **Who may change a lock, and how?** With pin requests (§ Pin
+   requests), anyone asks for a move in an issue and CI makes it,
+   skipping the check for requests signed by a key in the
+   allowed-signers file; pull requests then change no lock. The
+   verify-locks workflow (§ Verifying lock changes) instead checks the
+   lock changes that pull requests carry. Either needs a caller
+   workflow in each repo and a GitHub App.
 
 ## Checking the result
 

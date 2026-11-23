@@ -32,6 +32,14 @@
           category = "vm";
           description = "the packaged executable converges a workspace of local bare repositories and a fake GitHub, offline";
         };
+        vm-pin-request = {
+          derivation = import ../../../tests/vm/pin-request.nix {
+            inherit pkgs;
+            inherit (pkgs.flake-sync) flake-sync-pin-request;
+          };
+          category = "vm";
+          description = "flake-sync-pin-request pushes requested pin moves after the check, skips the check only for requests signed by an allowed key, and redoes a move whose push loses a race, offline";
+        };
         vm-verify-locks = {
           derivation = import ../../../tests/vm/verify-locks.nix {
             inherit pkgs;

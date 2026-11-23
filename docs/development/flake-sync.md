@@ -244,6 +244,77 @@ fails is closed and its branch deleted. When flake-sync's immediate
 merge of a pin move waits on the status, it turns on auto-merge too
 (§ How pin commits are published).
 
+## Pin requests
+
+A pin request is a GitHub issue that asks CI to move inputs of the root
+`flake.lock` of a repository to the tips of their branches. CI makes
+the move, so every byte of the lock comes from CI and the upstream
+branches. Its title is `flake-sync update <input> ...`.
+
+`flake-sync-pin-request`
+([`src/flake-sync-pin-request`](../../src/flake-sync-pin-request), the
+package of the same name) has three commands:
+
+- `sign --repo=<owner/name> <input> ...` prints the title and body of a
+  signed request. The body holds the request text (the repository, the
+  inputs, and an expiry, by default an hour ahead and at most a week)
+  and its signature by an SSH key, made with `ssh-keygen -Y sign` in
+  the namespace `flake-sync-pin-request`. The key is `--key` or the git
+  setting `user.signingkey`; a public key is signed through ssh-agent.
+- `file` signs the request and opens the issue with `gh`.
+- `serve` carries a request out, in a checkout of the default branch.
+
+`serve` takes the input names from the title and refuses a title with
+anything else in it, or an input that the root lock does not lock. It
+runs `nix flake update` on those inputs and, unless the request is
+trusted, `nix flake check` with builds. Then it commits `flake.lock`
+with `Requested-in:` and `Checked-by:` trailers and pushes to the
+default branch. When the push is refused because the branch moved, it
+starts again from the new tip, checking again. A request is trusted
+when its body carries a valid signature over a request for this
+repository and exactly these inputs, not expired, by a key that the
+allowed-signers file of the default branch
+(`.github/flake-sync-allowed-signers`, in the format of
+`ssh-keygen -Y verify`) accepts for the namespace
+`flake-sync-pin-request`. Any other request runs the check. Adding or
+rotating a key is a commit to that file:
+
+```text
+alice namespaces="flake-sync-pin-request" ssh-ed25519 AAAA...
+```
+
+[`.github/workflows/pin-request.yml`](../../.github/workflows/pin-request.yml)
+runs `serve` for a repository that calls it on `issues`:
+
+```yaml
+name: pin-request
+on:
+  issues:
+    types: [opened, reopened]
+permissions: {}
+jobs:
+  pin-request:
+    uses: clhodapp/flake-sync/.github/workflows/pin-request.yml@<commit>
+    permissions:
+      contents: read
+      issues: write
+    with:
+      flake-sync: <commit>
+      app-id: ${{ vars.PIN_REQUEST_APP_ID }}
+    secrets:
+      app-private-key: ${{ secrets.PIN_REQUEST_APP_PRIVATE_KEY }}
+```
+
+The App pushes the move, so it needs write access to contents, and the
+rulesets of the default branch must list it as a bypass actor. A push
+by an App starts the workflows that the push triggers, as a push by the
+workflow's `GITHUB_TOKEN` does not. The workflow answers on the issue
+with the commit and closes it, or comments why the request was refused
+or the check failed and leaves it open; reopening it runs the request
+again. `tests/vm/pin-request.sh` holds a scenario for each kind of
+signature that is not accepted, the failing check, malformed titles,
+and a push that loses a race.
+
 ## Down-sync: pull
 
 ```sh
@@ -646,6 +717,7 @@ files must be `git add`ed first or the flake source won't include them):
 ```sh
 nix build '.#checks.x86_64-linux.vm-lifecycle' -L --no-link
 nix build '.#checks.x86_64-linux.vm-verify-locks' -L --no-link
+nix build '.#checks.x86_64-linux.vm-pin-request' -L --no-link
 ```
 
 The fixture only works because the script supports git/file remotes in

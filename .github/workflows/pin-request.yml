@@ -1,0 +1,143 @@
+# SPDX-License-Identifier: MIT
+#
+# Carries out pin requests: issues titled `flake-sync update <input> ...`
+# that ask CI to move inputs of the root flake.lock to the tips of their
+# branches. A repository calls this workflow from a workflow triggered by
+# `issues`. flake-sync-pin-request serve does the work: it moves the
+# inputs, runs `nix flake check` unless the request is signed by a key in
+# the allowed-signers file of the default branch, commits, and pushes to
+# the default branch as the GitHub App. docs/development/flake-sync.md
+# (Pin requests) shows the caller.
+
+name: pin-request
+
+on:
+  workflow_call:
+    inputs:
+      flake-sync:
+        description: The full hash of the flake-sync commit whose flake-sync-pin-request runs, the same commit the caller names in `uses:`.
+        type: string
+        required: true
+      app-id:
+        description: The ID of the GitHub App that pushes the move. It needs write access to contents, and the rulesets of the default branch must let it push there.
+        type: string
+        required: true
+      signers:
+        description: The allowed-signers file, a path in the repository, whose keys may sign requests that skip the check.
+        type: string
+        default: .github/flake-sync-allowed-signers
+      extra-nix-config:
+        description: Lines added to nix.conf, for example the binary caches that the check builds from.
+        type: string
+        default: ""
+    secrets:
+      app-private-key:
+        description: The private key of the App named by app-id.
+        required: true
+
+permissions: {}
+
+jobs:
+  serve:
+    if: startsWith(github.event.issue.title, 'flake-sync update ')
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    permissions:
+      contents: read
+      issues: write
+    steps:
+      - name: Check how the workflow is called
+        env:
+          EVENT: ${{ github.event_name }}
+          FLAKE_SYNC: ${{ inputs.flake-sync }}
+        run: |
+          if [[ $EVENT != issues ]]; then
+            echo "::error::Call pin-request from a workflow triggered by issues."
+            exit 1
+          fi
+          if [[ ! $FLAKE_SYNC =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::inputs.flake-sync must be a full commit hash."
+            exit 1
+          fi
+
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          persist-credentials: false
+
+      - uses: cachix/install-nix-action@13d8dd58da0234aa297dedd986986ccb8e7f3e24 # v31
+        with:
+          github_access_token: ${{ github.token }}
+          extra_nix_config: |
+            experimental-features = nix-command flakes
+            ${{ inputs.extra-nix-config }}
+
+      - name: Mint the App token
+        id: app
+        uses: actions/create-github-app-token@f418cff399f7aef4c2f0ad47e25ca7a6abbdd6fc # v3.4.0
+        with:
+          app-id: ${{ inputs.app-id }}
+          private-key: ${{ secrets.app-private-key }}
+          permission-contents: write
+
+      # A retry runs the check again after the default branch moved, so
+      # the token exists while builds run. It stays out of the
+      # environment: a file only the runner user reads, which git gets
+      # through a credential helper. The builds of the check run as the
+      # build users of the Nix daemon.
+      - name: Give the token to git
+        env:
+          TOKEN: ${{ steps.app.outputs.token }}
+        run: |
+          umask 077
+          printf '%s' "$TOKEN" > "$RUNNER_TEMP/push-token"
+          cat > "$RUNNER_TEMP/git-credential-push" <<EOF
+          #!/bin/sh
+          [ "\$1" = get ] || exit 0
+          echo username=x-access-token
+          printf 'password=%s\n' "\$(cat '$RUNNER_TEMP/push-token')"
+          EOF
+          chmod 700 "$RUNNER_TEMP/git-credential-push"
+          git config --local credential.helper "$RUNNER_TEMP/git-credential-push"
+
+      - name: Carry out the request
+        id: serve
+        env:
+          TITLE: ${{ github.event.issue.title }}
+          BODY: ${{ github.event.issue.body }}
+          REPO: ${{ github.repository }}
+          ISSUE: ${{ github.event.issue.number }}
+          FLAKE_SYNC: ${{ inputs.flake-sync }}
+          SIGNERS: ${{ inputs.signers }}
+        run: |
+          printf '%s' "$TITLE" > "$RUNNER_TEMP/title"
+          printf '%s' "$BODY" > "$RUNNER_TEMP/body"
+          nix run "github:clhodapp/flake-sync/$FLAKE_SYNC#flake-sync-pin-request" -- serve \
+            --repo="$REPO" --title="$RUNNER_TEMP/title" --body="$RUNNER_TEMP/body" \
+            --signers="$SIGNERS" --issue="$ISSUE"
+
+      - name: Answer the issue
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          ISSUE: ${{ github.event.issue.number }}
+          RESULT: ${{ steps.serve.outputs.result }}
+          MESSAGE: ${{ steps.serve.outputs.message }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          rm -f "$RUNNER_TEMP/push-token"
+          case $RESULT in
+            pushed | unchanged)
+              printf '%s\n' "$MESSAGE" > "$RUNNER_TEMP/answer"
+              gh issue close "$ISSUE" -R "$REPO" --reason completed --comment "$(cat "$RUNNER_TEMP/answer")"
+              ;;
+            refused | failed)
+              printf '%s\n\nThe run: %s\n' "$MESSAGE" "$RUN_URL" > "$RUNNER_TEMP/answer"
+              gh issue comment "$ISSUE" -R "$REPO" --body-file "$RUNNER_TEMP/answer"
+              ;;
+            *)
+              printf 'The request did not finish. The run: %s\n' "$RUN_URL" > "$RUNNER_TEMP/answer"
+              gh issue comment "$ISSUE" -R "$REPO" --body-file "$RUNNER_TEMP/answer"
+              ;;
+          esac
