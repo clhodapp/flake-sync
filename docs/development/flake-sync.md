@@ -124,14 +124,17 @@ fix the failing check) and rerun.
 
 Outside CI, pin commits reach the default branch of a GitHub repo
 through a pull request that holds only them and is merged at once:
-`converge` (and `step push`) pushes them to a `flake-sync/pins-<rev>`
-branch, opens the pull request with `gh`, merges it with the first
+`converge` (and `step push`) pushes them to a pin-move branch, opens
+the pull request with `gh`, merges it with the first
 method the repo allows (rebase, squash, merge commit), deletes the
 branch, and moves the local default branch onto the merged result, so
 the next level of the DAG pins the commit that is actually on the
 remote. A default branch ahead with commits other than flake-sync's
 pin and pointer commits is refused, since an immediate merge would skip
-their review. When the merge cannot happen now:
+their review, and so is a pin commit that changes anything but
+`flake.lock` files (and, in the workspace repo, submodule pointers).
+Each pin commit carries a `Checked-by: flake-sync --check=<mode>`
+trailer naming the check it passed. When the merge cannot happen now:
 
 - the default branch moved on the remote: the pull request is closed
   and the run stops; a rerun recomputes the pins on the new tip;
@@ -143,7 +146,16 @@ pin commit is stranded locally. `--trust-local-checks` skips the wait:
 it runs `nix flake check` here at the `--check` depth, then merges with
 `gh pr merge --admin`, which needs admin rights on the repo. CI
 convergence (`GITHUB_ACTIONS=true`) and repos without a GitHub remote
-push pin commits directly.
+push pin commits directly. `gh` is `FLAKE_SYNC_GH` when set, else the
+first `gh` on the caller's PATH, which a credential wrapper may
+provide, else the packaged one.
+
+The prefix `flake-sync/pins/` is reserved for pin-move branches. A
+pin-move branch holds pin commits on the remote default branch and
+nothing else, so it is not a topic branch. It is named
+`flake-sync/pins/<hash>`, after the paths and contents of the files the
+move writes, so two runs that make the same move meet at one branch:
+the second finds it open, names its pull request, and stops.
 
 ## Down-sync: pull
 
@@ -253,8 +265,13 @@ worktree's branch, created from `origin`'s default branch tip with no
 upstream, so a push sends it to a topic branch of the same name.
 
 Topic branches carry no pin moves; locks move only by convergence on the
-default branches. In a linked worktree, a publishing `converge`,
-`step update-pins`, and `step` with no explicit action refuse. To build
+default branches. In a linked worktree, a publishing `converge`, and
+`step` other than `step push`, read each submodule from its remote
+default branch, as for one that is not checked out, and make each pin
+move in a temporary worktree of the shared module repo at
+`origin/<default>`, published as a pin move (above); the topic branches
+checked out there stay as they are. The workspace repo's pins and
+pointers are left to convergence of its default branch. To build
 against local, unpushed changes of other repos, use
 `override-inputs --local`. `step push <repo>` pushes a topic branch, and
 refuses while a repo it depends on has commits that are not pushed yet,

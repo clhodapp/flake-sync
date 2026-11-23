@@ -87,5 +87,5 @@ commit them first.
 - Do not edit `flake.lock` or a submodule pointer to move a pin;
   convergence does it, through the check gate.
 - Do not commit a lock that points at another repo's unpushed or unmerged
-  commit. In a linked worktree flake-sync refuses to make pin commits on
-  topic branches at all.
+  commit. flake-sync makes pin commits only on pin-move branches based on
+  the default branches, never on a topic branch.

@@ -260,6 +260,7 @@ LOCAL=false
 CHECKOUT_MISSING=false
 TRUST_LOCAL_CHECKS=false
 CHECKOUT_ALL=false
+PIN_FROM_DEFAULT=false
 WITH_PARTITIONS=false
 WITH_TESTS=false
 WITH_EXTERNAL=false
@@ -365,12 +366,12 @@ discover_repos() {
     name=$(basename "$path")
     [ "$name" != "$WS" ] || die "submodule name collides with workspace name '$WS'"
     url=$(git config -f "$ROOT/.gitmodules" "${key%.path}.url")
-    if [ -e "$ROOT/$path/.git" ]; then
+    if [ -e "$ROOT/$path/.git" ] && ! $PIN_FROM_DEFAULT; then
       [ -f "$ROOT/$path/flake.nix" ] || continue
       DIR[$name]=$ROOT/$path
     else
-      # Not checked out here: read_absent_state reads it from its remote,
-      # and drops it there if it is not a flake.
+      # Not checked out here, or pinned from its default branch: read_absent_state
+      # reads it from its remote, and drops it there if it is not a flake.
       ABSENT[$name]=$path
       ABSENTURL[$name]=$url
       ABSENTNAME[$name]=${key#submodule.}
@@ -658,11 +659,14 @@ refresh_state() { # re-read git/pin state for every repo (after a mutating actio
   local repo
   # An absent repo that an action checked out joins the checked-out ones.
   for repo in ${ABSENT[@]+"${!ABSENT[@]}"}; do
-    if [ -e "$ROOT/${ABSENT[$repo]}/.git" ]; then
+    if ! $PIN_FROM_DEFAULT && [ -e "$ROOT/${ABSENT[$repo]}/.git" ]; then
       DIR[$repo]=$ROOT/${ABSENT[$repo]}
       unset "ABSENT[$repo]" "ABSENT_READ[$repo]"
     fi
   done
+  # Pinning from the default branches moves those branches on the remote,
+  # so their state is read again after each action.
+  ! $PIN_FROM_DEFAULT || ABSENT_READ=()
   # pull clones or leaves out absent submodules itself, from .gitmodules.
   [ "$CMD" = pull ] || read_absent_states
   for repo in "${!DIR[@]}"; do
@@ -777,6 +781,12 @@ build_plan() {
   PLAN=()
   local repo
   for repo in "${TOPO[@]}"; do
+    # The workspace repo's topic branch takes no pin moves either; its pins
+    # and pointers move by convergence of its default branch.
+    if $PIN_FROM_DEFAULT && [ "$repo" = "$WS" ]; then
+      PLAN+=("WARN|workspace|$WS|its pins and submodule pointers move by convergence of its default branch, not from a linked worktree")
+      continue
+    fi
     local ready blocked extready
     ready=$(stale_pin_inputs "$repo")
     blocked=$(blocked_pin_targets "$repo")
@@ -795,6 +805,8 @@ build_plan() {
         # Advancing needs a checkout; pins that cannot advance do not.
         if [ -z "$ready" ] && [ -z "$extready" ]; then
           PLAN+=("BLOCKED|update-pins|$repo|stale pin(s) to unpushed target(s): $blockednames")
+        elif $PIN_FROM_DEFAULT; then
+          PLAN+=("READY|pin-on-default|$repo|advance pins on its default branch: $names")
         elif $CHECKOUT_MISSING; then
           PLAN+=("READY|checkout|$repo|not checked out here; clone it to advance pins: $names")
         else
@@ -1046,20 +1058,44 @@ do_update_pins() {
   fi
   local msg
   msg="maint: update flake pins ($(IFS=,; echo "${names[*]}"))"
-  run git -C "$dir" commit --quiet -m "$msg" -- "${paths[@]}"
+  local trailer=()
+  [ "$CHECK_MODE" = none ] || trailer=(-m "Checked-by: flake-sync --check=$CHECK_MODE")
+  run git -C "$dir" commit --quiet -m "$msg" ${trailer[@]+"${trailer[@]}"} -- "${paths[@]}"
   echo "${C_GRN}updated pins in $repo: ${names[*]}${C_OFF}"
   report_held "$repo" "$held_report"
 }
 
-GH=${FLAKE_SYNC_GH:-gh}
+# The gh to run: FLAKE_SYNC_GH, else the caller's gh, which a credential
+# wrapper may provide, else the packaged one (first on the PATH).
+mapfile -t GH_ON_PATH < <(type -ap gh 2>/dev/null || true)
+GH=${FLAKE_SYNC_GH:-${GH_ON_PATH[1]:-${GH_ON_PATH[0]:-gh}}}
 
-push_via_pr() { # put repo $1's commits ahead of origin/$2, all pin commits, on $2 through a pull request merged at once
-  local repo=$1 default=$2 dir=${DIR[$1]} slug=${SLUG[$1]} subject head branch url body
+push_via_pr() { # put repo $1's commits ahead of origin/$2, all pin commits, on $2 through a pull request merged at once; $3 = scratch for a temporary checkout
+  local repo=$1 default=$2 scratch=${3:-} dir=${DIR[$1]} slug=${SLUG[$1]} subject branch url body file files locks
   subject=$(git -C "$dir" log --format=%s "origin/$default..HEAD" \
     | grep -v -e '^maint: update flake pins (' -e '^maint: bump ' | head -1 || true)
   [ -z "$subject" ] || die "$repo has commits on $default that are not flake-sync pin updates (first: '$subject'); a converge outside CI merges only pin updates. Move the other commits to a topic branch and open a pull request for them"
-  head=$(git -C "$dir" rev-parse HEAD)
-  branch=flake-sync/pins-${head:0:12}
+  # A pin move changes flake.lock files, and in the workspace repo also
+  # submodule pointers, and nothing else. Its branch is named after what it
+  # writes, so two runs that make the same move meet at one branch and one
+  # pull request.
+  local pointers=" ${SUBPATH[*]} "
+  files=$(git -C "$dir" diff --name-only "origin/$default..HEAD")
+  locks=""
+  while IFS= read -r file; do
+    [ -n "$file" ] || continue
+    if [ "${file##*/}" != flake.lock ]; then
+      [ "$repo" = "$WS" ] && [[ $pointers == *" $file "* ]] \
+        || die "$repo: the pin commits change $file; a pin move changes flake.lock files and submodule pointers only"
+    fi
+    locks+="$file $(git -C "$dir" rev-parse "HEAD:$file")"$'\n'
+  done <<<"$files"
+  [ -n "$locks" ] || die "$repo: the pin commits change nothing"
+  branch=flake-sync/pins/$(printf '%s' "$locks" | git hash-object --stdin | cut -c1-12)
+  if git -C "$dir" ls-remote --exit-code --heads origin "$branch" >/dev/null 2>&1; then
+    url=$("$GH" pr list -R "$slug" --head "$branch" --state open --json url --jq '.[0].url // empty' 2>/dev/null || true)
+    die "$repo: the same pin move is already open on $branch${url:+ ($url)}; rerun once it merges"
+  fi
   subject=$(git -C "$dir" log -1 --format=%s HEAD)
   body=$(printf 'Pin updates from flake-sync converge, merged at once:\n\n%s\n' "$(git -C "$dir" log --format='- %s' "origin/$default..HEAD")")
   run git -C "$dir" push --quiet origin "HEAD:refs/heads/$branch" || die "pushing $branch of $repo failed"
@@ -1103,7 +1139,7 @@ push_via_pr() { # put repo $1's commits ahead of origin/$2, all pin commits, on 
   # commits, or the pin commit stays in the pull request, or a rerun
   # recomputes it.
   run git -C "$dir" fetch --quiet origin
-  run git -C "$dir" reset --quiet --keep "origin/$default" || die "$repo: could not move $default onto origin/$default"
+  [ -n "$scratch" ] || run git -C "$dir" reset --quiet --keep "origin/$default" || die "$repo: could not move $default onto origin/$default"
   $merged || case $state in
     DIRTY | BEHIND) die "$repo: $default moved on the remote while converging; closed $url, rerun to recompute the pins" ;;
     *) die "$repo: $url could not be merged now (merge state $state); auto-merge is on, rerun once it merges" ;;
@@ -1234,10 +1270,64 @@ do_checkout_linked() { # in a linked worktree of the workspace, check out absent
   echo "${C_GRN}checked out $repo at $path, on branch $branch from $start, sharing the workspace's repo for it${C_OFF}"
 }
 
+do_pin_on_default() { # move repo $1's pins on its remote default branch, in a temporary worktree of its module repo
+  local repo=$1 common module default tmp status=0
+  [ -n "${ABSENTNAME[$repo]:-}" ] || die "$repo is not a submodule of the workspace"
+  common=$(git -C "$ROOT" rev-parse --path-format=absolute --git-common-dir)
+  module=$common/modules/${ABSENTNAME[$repo]}
+  if [ ! -d "$module" ]; then
+    tmp=$(mktemp -d)
+    run git clone --quiet --no-checkout --separate-git-dir="$module" "${ABSENTURL[$repo]}" "$tmp/clone" \
+      || { rm -rf "$tmp"; die "cloning $repo failed"; }
+    rm -rf "$tmp"
+  fi
+  run git -C "$module" fetch --quiet origin || die "fetching $repo failed"
+  default=$(git -C "$module" symbolic-ref --quiet --short refs/remotes/origin/HEAD || echo origin/main)
+  default=${default#origin/}
+  if $DRY_RUN; then
+    echo "${C_BLD}+ move the pins of $repo on origin/$default, in a temporary worktree of $module${C_OFF}"
+    return 0
+  fi
+  # The temporary worktree lives in the scratch dir that the exit trap
+  # removes; a run that fails before removing it leaves a registration that
+  # the next prune drops.
+  ext_tmpdir >/dev/null
+  tmp=$EXTTMP/pins-$repo
+  run git -C "$module" worktree prune
+  run git -C "$module" worktree add --quiet --detach "$tmp" "origin/$default" \
+    || die "adding a temporary worktree of $repo failed"
+  # The pin commit is made on the remote default branch's tip, then
+  # published as a pin move. The actions run in a subshell of converge, or
+  # end the run of step, so the temporary checkout stays out of the state
+  # of the run.
+  DIR[$repo]=$tmp BRANCH[$repo]=$default DIRTY[$repo]="" AHEAD[$repo]=0 BEHIND[$repo]=0
+  unset "ABSENT[$repo]"
+  # A partial advance reports what it held and fails; what did advance
+  # is published all the same.
+  ( do_update_pins "$repo" ) || status=$?
+  if [ "$(git -C "$tmp" rev-parse HEAD)" != "$(git -C "$tmp" rev-parse "origin/$default")" ]; then
+    publish_pins "$repo" "$default" scratch
+  fi
+  git -C "$module" worktree remove --force "$tmp" || true
+  return $status
+}
+
+publish_pins() { # put repo $1's pin commits on its default branch $2: an immediate pull request on GitHub outside CI, a push otherwise; $3 = scratch for a temporary checkout
+  local repo=$1 default=$2 dir=${DIR[$1]}
+  if [ -n "${SLUG[$repo]:-}" ] && [ "${GITHUB_ACTIONS:-}" != true ]; then
+    push_via_pr "$repo" "$default" "${3:-}"
+  else
+    run git -C "$dir" push --quiet origin "HEAD:refs/heads/$default" || die "pushing the pins of $repo to $default failed"
+    echo "${C_GRN}pushed the pin updates of $repo to $default${C_OFF}"
+  fi
+}
+
 run_action() {
   local action=$1 repo=$2
   case $action in
-    update-pins) do_update_pins "$repo" ;;
+    update-pins)
+      if $PIN_FROM_DEFAULT; then do_pin_on_default "$repo"; else do_update_pins "$repo"; fi ;;
+    pin-on-default) do_pin_on_default "$repo" ;;
     push) do_push "$repo" ;;
     bump-submodules) do_bump_submodules ;;
     # converge advances from the remote heads, so the clone starts there
@@ -2017,16 +2107,17 @@ if [ "$CMD" = override-inputs ]; then
 fi
 
 # A linked worktree of the workspace holds topic branches, which carry no
-# pin moves: locks move only by convergence on the default branches,
-# after merges. A topic branch is pushed only once every repo it depends
-# on has its commits pushed.
+# pin moves. A publishing converge or step there reads each submodule from
+# its remote default branch and makes the pin moves on that branch, in a
+# temporary worktree, leaving the topic branches as they are. `step push
+# <repo>` pushes a topic branch, once every repo it depends on has its
+# commits pushed.
 LINKED=false
 [ "$(git -C "$ROOT" rev-parse --path-format=absolute --git-dir)" = "$(git -C "$ROOT" rev-parse --path-format=absolute --git-common-dir)" ] || LINKED=true
 if $LINKED && ! $LOCAL; then
   case $CMD in
-    converge) die "converge publishes from the primary checkout, onto the default branches; in a linked worktree use converge --local, or override-inputs --local to build against local changes" ;;
-    step) [ "${ARGS[0]:-}" = push ] && [ ${#ARGS[@]} -eq 2 ] \
-      || die "in a linked worktree, step runs only 'step push <repo>': topic branches carry no pin moves" ;;
+    converge) PIN_FROM_DEFAULT=true DO_FETCH=true ;;
+    step) [ "${ARGS[0]:-}" = push ] || PIN_FROM_DEFAULT=true DO_FETCH=true ;;
   esac
 fi
 

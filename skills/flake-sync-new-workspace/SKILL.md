@@ -76,8 +76,8 @@ Ask these, explain the consequences below, and record the answers.
    which is slower and needs the builders; `--check=none` skips it.
 6. **Where do agents work?** In the primary checkout, or in linked
    worktrees with `flake-sync checkout` (§ Agent worktrees). In
-   worktrees, flake-sync already refuses pin commits on topic branches;
-   the instructions should say whether agents open pull requests, push
+   worktrees, flake-sync makes pin moves on the default branches, not on
+   topic branches; the instructions should say whether agents open pull requests, push
    topic branches only, or stop at local commits.
 
 ## Checking the result

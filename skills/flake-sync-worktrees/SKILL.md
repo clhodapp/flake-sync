@@ -85,13 +85,14 @@ until `git add`, and a `git+file` input sees only committed changes. To
 build a consumer against a sibling's work, commit it and use
 `nix build $(flake-sync --local override-inputs ./<consumer>#<attr>)`.
 
-**flake-sync refuses `converge`, `step update-pins` or a bare `step` in
-the worktree.**
-A worktree holds topic branches, and flake-sync makes no pin commits on
-them; pins move by convergence on the default branches.
-`converge --local` checks convergence without publishing, and
-`step push <repo>` pushes a topic branch once the repos it depends on
-are pushed.
+**`converge` in the worktree moves pins on other branches than the
+ones checked out.**
+A worktree holds topic branches, which get no pin commits. A publishing
+`converge` there reads each submodule from its remote default branch
+and makes each pin move in a temporary worktree at `origin/<default>`,
+pushed to a `flake-sync/pins/` branch. `converge --local` checks
+convergence without publishing, and `step push <repo>` pushes a topic
+branch once the repos it depends on are pushed.
 
 **`flake-sync status` or `converge --local` lists repos as `not checked
 out`, or blocks on one.**

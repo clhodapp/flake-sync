@@ -819,7 +819,7 @@ expect_contains "$out" "commit app: uncommitted changes in flake.lock that are n
 git -C projects/app checkout -q -- flake.lock
 assert_converged "discarding the change converges again"
 
-echo "=== 24. in a linked worktree of the workspace, checkout shares the module repos and pins move only by explicit steps"
+echo "=== 24. in a linked worktree of the workspace, checkout shares the module repos, topic branches carry no pin moves, and converge pins on the default branches"
 wt=$(mktemp -d)/wt
 git worktree add -q -b agent-topic "$wt"
 modules=$(git rev-parse --path-format=absolute --git-common-dir)/modules
@@ -836,16 +836,11 @@ echo "ok: checkout in a linked worktree adds linked worktrees of the shared modu
 echo topic >"$wt/projects/lib/topic.txt"
 git -C "$wt/projects/lib" add topic.txt
 git -C "$wt/projects/lib" commit -qm "feat: lib change on a topic branch"
-rc=0; out=$(cd "$wt" && "$FS" --fetch converge 2>&1) || rc=$?
-[ "$rc" -ne 0 ] || fail "a publishing converge should refuse in a linked worktree"
-expect_contains "$out" "converge publishes from the primary checkout" "converge in a linked worktree points at the primary checkout"
-rc=0; out=$(cd "$wt" && "$FS" step 2>&1) || rc=$?
-[ "$rc" -ne 0 ] || fail "step with no action should refuse in a linked worktree"
-git --git-dir="$HUB/lib.git" rev-parse -q --verify agent-topic >/dev/null && fail "nothing should be pushed by the refused commands"
-echo "ok: a linked worktree refuses converge and step with no action"
-rc=0; out=$(cd "$wt" && "$FS" step update-pins app 2>&1) || rc=$?
-[ "$rc" -ne 0 ] || fail "update-pins should refuse in a linked worktree"
-expect_contains "$out" "topic branches carry no pin moves" "update-pins in a linked worktree names the rule"
+lib_topic=$(head_rev "$wt/projects/lib")
+out=$(cd "$wt" && "$FS" --fetch converge 2>&1) || { printf 'output was:\n%s\n' "$out" >&2; fail "converge in a linked worktree with converged default branches"; }
+[ "$(head_rev "$wt/projects/lib")" = "$lib_topic" ] || fail "converge must leave lib's topic branch as it is"
+git --git-dir="$HUB/lib.git" rev-parse -q --verify agent-topic >/dev/null && fail "converge must not push a topic branch"
+echo "ok: converge in a linked worktree reads the default branches and leaves the topic branches alone"
 echo app-topic >"$wt/projects/app/topic.txt"
 git -C "$wt/projects/app" add topic.txt
 git -C "$wt/projects/app" commit -qm "feat: app change that needs the lib change"
@@ -872,8 +867,13 @@ out=$(cd "$wt" && "$FS" --fetch unmerged-commits --json 2>/dev/null) || fail "un
 [ "$(jq -r 'map(.repo) | join(" ")' <<<"$out")" = app ] || { echo "$out" >&2; fail "only app should be left"; }
 [ "$(state_of app "$out")" = "waiting for convergence" ] || fail "app's main still pins the old lib"
 echo "ok: after the dependency merges, the consumer waits for convergence"
-$FS --heads pull >/dev/null 2>&1 || fail "pull --heads in the primary"
-$FS --fetch converge >/dev/null 2>&1 || fail "converge in the primary after the merge"
+app_topic=$(head_rev "$wt/projects/app")
+out=$(cd "$wt" && "$FS" --fetch converge 2>&1) || { printf 'output was:\n%s\n' "$out" >&2; fail "converge in the linked worktree after the merge"; }
+[ "$(git --git-dir="$HUB/app.git" show main:flake.lock | jq -r '.nodes[.nodes[.root].inputs.lib].locked.rev')" = "$(hub_rev lib)" ] \
+  || fail "converge in the linked worktree should pin the merged lib on app's main"
+[ "$(head_rev "$wt/projects/app")" = "$app_topic" ] || fail "app's topic branch must stay where it is"
+[ -z "$(git --git-dir="$HUB/app.git" for-each-ref refs/heads/flake-sync)" ] || fail "a fixture remote takes the pins directly, without a pin-move branch"
+echo "ok: converge in a linked worktree moves the pins on the default branches"
 out=$(cd "$wt" && "$FS" --fetch unmerged-commits --json 2>/dev/null) || fail "unmerged-commits --json after convergence"
 [ "$(state_of app "$out")" = ready ] || { echo "$out" >&2; fail "app should be ready once its main pins the merged lib"; }
 echo "ok: once the default branch converges, the consumer is ready"
@@ -923,9 +923,10 @@ esac
 FAKE
 chmod +x "$gh2/fake/gh"
 export FLAKE_SYNC_GH=$gh2/fake/gh FAKE_GH_DIR=$gh2/fake FAKE_GH_HUB=$gh2/hub FAKE_GH_METHODS=squash
-pin_commit() { # commit a pin-update-shaped change $1 in one
-  echo "$1" >"$gh2/ws2/projects/one/$1.txt"
-  git -C "$gh2/ws2/projects/one" add "$1.txt"
+pin_commit() { # commit a pin-update-shaped change $1 in one: a lock under directory $1
+  mkdir -p "$gh2/ws2/projects/one/$1"
+  echo "{\"nodes\": {\"root\": {}}, \"root\": \"root\", \"version\": 7, \"note\": \"$1\"}" >"$gh2/ws2/projects/one/$1/flake.lock"
+  git -C "$gh2/ws2/projects/one" add "$1/flake.lock"
   git -C "$gh2/ws2/projects/one" commit -qm "maint: update flake pins ($1)"
 }
 hub_one() { git --git-dir="$gh2/hub/one.git" rev-parse main; }
@@ -952,6 +953,21 @@ expect_contains "$out" "auto-merge is on" "a merge blocked by checks turns on au
 grep -q -- "--squash --auto" "$gh2/fake/log" || fail "auto-merge should be requested"
 [ "$(head_rev "$gh2/ws2/projects/one")" = "$(hub_one)" ] || fail "the local main should be reset to the remote main"
 echo "ok: a blocked merge waits on auto-merge and leaves no local pin commit"
+# The same move again finds its branch still open, and stops there.
+pin_commit app
+rc=0; out=$(cd "$gh2/ws2" && FAKE_GH_BLOCK=1 "$FS" step push one 2>&1) || rc=$?
+[ "$rc" -ne 0 ] || fail "a second run of the same pin move should stop"
+expect_contains "$out" "the same pin move is already open on flake-sync/pins/" "the second run names the open pin-move branch"
+git -C "$gh2/ws2/projects/one" reset -q --hard origin/main
+echo "ok: two runs of the same pin move share one branch"
+echo stray >"$gh2/ws2/projects/one/stray.txt"
+git -C "$gh2/ws2/projects/one" add stray.txt
+git -C "$gh2/ws2/projects/one" commit -qm "maint: update flake pins (stray)"
+rc=0; out=$(cd "$gh2/ws2" && "$FS" step push one 2>&1) || rc=$?
+[ "$rc" -ne 0 ] || fail "a pin commit that changes another file should not be pushed as a pin move"
+expect_contains "$out" "the pin commits change stray.txt" "the refusal names the file"
+git -C "$gh2/ws2/projects/one" reset -q --hard origin/main
+echo "ok: a pin move changes flake.lock files only"
 pin_commit trusted
 out=$(cd "$gh2/ws2" && FAKE_GH_BLOCK=1 "$FS" --trust-local-checks step push one 2>&1) || { printf 'output was:\n%s\n' "$out" >&2; fail "--trust-local-checks should merge past the blocked checks"; }
 grep -q -- "--squash --admin" "$gh2/fake/log" || fail "--trust-local-checks should merge with --admin"
