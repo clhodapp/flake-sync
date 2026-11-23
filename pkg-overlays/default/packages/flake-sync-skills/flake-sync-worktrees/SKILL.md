@@ -1,6 +1,6 @@
 ---
 name: flake-sync-worktrees
-description: Diagnose and fix problems with git worktrees in a workspace whose submodules are flake repos, as agent sessions use them. Use when a worktree is missing its submodules, has a submodule on a detached HEAD or a separate clone, refuses a branch, shows submodules as modified, will not be removed, when a flake built in a worktree ignores new or changed files, or when flake-sync refuses a command in a worktree.
+description: Diagnose and fix problems with git worktrees in a workspace whose submodules are flake repos, as agent sessions use them. Use when a worktree is missing its submodules, has a submodule on a detached HEAD or a separate clone, refuses a branch, shows submodules as modified, will not be removed, when a flake built in a worktree ignores new or changed files, when flake-sync refuses a command in a worktree, or when git, nix or a push fails in a worktree under a sandbox because a path is read-only, a connection is refused, or a tool is missing.
 ---
 
 # Troubleshooting worktrees in a flake-sync workspace
@@ -98,3 +98,28 @@ out`, or blocks on one.**
 The worktree holds only some submodules; flake-sync reads the others
 from their remotes. A blocker on such a repo means the pins in its lock
 need moving: `--checkout-missing` lets `converge --local` add it.
+
+## Worktrees inside a sandbox
+
+Agent sessions often run commands in a sandbox that allows writes only
+to the session's directories and network access only to listed hosts.
+A worktree sits badly with that, because its git data is not inside it:
+a linked worktree's `.git` is a file pointing at `.git/worktrees/<name>`
+in the primary checkout, and a submodule checked out by `flake-sync
+checkout` points into `.git/modules/<name>`. Git writes there for
+ordinary operations (the index, refs, objects, `index.lock`).
+
+When an operation fails under a sandbox, find the path or host it needed
+and report it: the sandbox's grants are its owner's decision, and a
+workaround that skips a check or a hook needs that owner's approval too.
+
+| Symptom | Cause | Grant that fixes it |
+|---|---|---|
+| `Unable to create '<…>/index.lock': Read-only file system`, or a ref update failing the same way | The worktree's git dir, `.git/worktrees/<name>`, is outside the writable paths. | Write access to that worktree's git dir. |
+| Commits, fetches or `flake-sync checkout` in a submodule fail with `Read-only file system` under `.git/modules/<name>` | The shared submodule repo is not writable. | Write access to `.git/modules/<name>`. |
+| Git refuses to touch a worktree of another session | Its entry under `.git/worktrees/` is read-only to this session. | Usually intended; work in the worktree of this session. |
+| A worktree made with the submodule as current directory fails on every write | Its git dir is `.git/modules/<name>/worktrees/<id>`, which the sandbox treats as belonging to another session. | Make the worktree from the workspace's primary checkout instead. |
+| `fetch` or `push` fails to connect, or an SSH remote reports `No user exists for uid` | The forge host is not allowed, or the sandbox gives SSH no user identity. | Network access to the forge; an identity for SSH inside the sandbox, or an HTTPS remote with a credential helper. |
+| A push fails in a hook, such as `git-lfs` not found by a `pre-push` hook | The hook needs a tool the sandbox does not provide. | That tool on the sandbox's PATH. |
+| A script fails with `command not found` for a basic tool | The sandbox provides only the tools it declares. | That tool among the sandbox's declared tools. |
+| `nix build` cannot reach the daemon, or a `path:` flake input fails to read a worktree | The Nix daemon socket, or the `.git` of the primary checkout that the worktree points to, is outside the readable paths. | Access to the daemon socket; read access to the `.git` of the primary checkout. |
