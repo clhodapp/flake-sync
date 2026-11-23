@@ -115,6 +115,13 @@ flake-sync converge --dry-run   # preview first step + remaining plan
 flake-sync converge             # loop until converged or blocked
 ```
 
+`converge` exits 1 when blockers remain or some pins were held back
+(failing check, unpushed target); that is a report, not a script failure.
+Resolve the listed blockers (commit dirty files, check out a branch, pull,
+fix the failing check) and rerun.
+
+### How pin commits are published
+
 Outside CI, pin commits reach the default branch of a GitHub repo
 through a pull request that holds only them and is merged at once:
 `converge` (and `step push`) pushes them to a `flake-sync/pins-<rev>`
@@ -137,11 +144,6 @@ it runs `nix flake check` here at the `--check` depth, then merges with
 `gh pr merge --admin`, which needs admin rights on the repo. CI
 convergence (`GITHUB_ACTIONS=true`) and repos without a GitHub remote
 push pin commits directly.
-
-`converge` exits 1 when blockers remain or some pins were held back
-(failing check, unpushed target); that is a report, not a script failure.
-Resolve the listed blockers (commit dirty files, check out a branch, pull,
-fix the failing check) and rerun.
 
 ## Down-sync: pull
 
@@ -232,6 +234,14 @@ submodule in. `check` skips a repo that is not checked out and names it.
 `pull` is the exception to all of this: it reads only git's registration,
 as described under `pull`.
 
+## Agent worktrees
+
+```sh
+git worktree add -b <topic> <path>     # from the workspace's primary checkout
+cd <path>
+flake-sync checkout <repo>...          # materialize the submodules the task needs
+```
+
 In a linked worktree of the workspace (`git worktree add`, as agent
 sessions use), `checkout` shares the repo git keeps for each submodule in
 the workspace's common git dir (`.git/modules/<submodule name>`), so a
@@ -249,6 +259,22 @@ against local, unpushed changes of other repos, use
 `override-inputs --local`. `step push <repo>` pushes a topic branch, and
 refuses while a repo it depends on has commits that are not pushed yet,
 so branches reach the remote in dependency order.
+
+## Changes that span repos: pull requests
+
+```sh
+flake-sync --fetch unmerged-commits            # what is unmerged, in pull request order
+flake-sync pr <repo> --title=<title> --body-file=<file>
+flake-sync rebase <repo>                       # onto the converged default branch
+```
+
+Four rules shape these commands. Work freely locally: build against
+committed, unpushed changes of other repos with `override-inputs
+--local`, which writes no lock. Push a topic branch only once what it
+builds against is on the remote. Keep a pull request a draft until its
+target branch holds what it needs. Carry no lock moves in a pull request
+of a change: locks move only by convergence on the default branches.
+The commands work in the primary checkout and in agent worktrees alike.
 
 `unmerged-commits` (`--json` for scripts) lists, in DAG order, the
 checked-out repos whose branch has commits besides pin updates that are
@@ -315,9 +341,9 @@ bumps, because those are publication. Two uses:
   waiting for publication's pin commits to land and be pulled.
 
 Because nothing can strand without commits, `--local` runs where the
-publishing commands refuse: dirty trees, detached HEADs, secondary
-checkouts and worktrees (it covers whatever submodules are initialized
-there). Pins still advance only to *pushed* sibling revs, so the locks it
+publishing commands refuse: dirty trees, detached HEADs, and linked
+worktrees of the workspace (it covers whatever submodules are checked
+out there, and reads the others from their remotes). Pins still advance only to *pushed* sibling revs, so the locks it
 writes are byte-for-byte what publication will commit. Those dirty locks
 are previews. Discard them with `git checkout -- flake.lock` before
 pulling once the matching pin commit lands remotely, since even an
@@ -328,9 +354,7 @@ advanced as stale, and `converge` commits and pushes it. A managed lock
 that still differs from `HEAD` with no pin update planned blocks
 convergence: it holds changes flake-sync does not make, which need a
 commit or a `git checkout` by hand. To build against *unpushed* sibling
-changes, stay with transient overrides
-(`--override-input <dep> path:../<dep>`); `--local` never writes an
-unpushed rev into a lock.
+changes, use `override-inputs --local` (below); it writes no lock.
 
 `--local` composes with the rest of the surface: `status --local` reports
 local convergence, `--fetch` refreshes remote refs first so pushed-ness
@@ -470,8 +494,9 @@ ignores the flag rather than starting another.
 - **Uncommitted changes other than `flake.lock` block that repo's
   automation** (`need manual commit`). Commit them yourself, then rerun.
   Untracked files don't block.
-- **The script never pulls or rebases.** `behind upstream by N` means you
-  rebase/pull manually; only then will pushes for that repo become ready.
+- **`converge` never pulls or rebases.** `behind upstream by N` means
+  the repo needs `flake-sync pull`, or `flake-sync rebase <repo>` for a
+  topic branch; only then will pushes for that repo become ready.
   If a remote moves mid-run (another checkout pushed), the rejected push
   gets a clear message with the manual fix, that repo's remote refs are
   refreshed, and `converge` continues with whatever independent work
@@ -482,8 +507,10 @@ ignores the flag rather than starting another.
   staleness right after a push, and works when a dep sits on a non-default
   branch. Re-pinning one input also refreshes its transitive subtree in the
   lock (expected; that's nix re-locking the inputs of the dep).
-- Auto-commits use a `maint:` message convention and commit via
-  pathspec, so anything else you have staged is left alone.
+- Auto-commits use a `maint:` message convention: `maint: update flake
+  pins (…)` for lock changes, committed by pathspec, and `maint: bump …`
+  for workspace pointers, built from a scratch index of `HEAD` plus the
+  new pointers. Either way anything else you have staged is left alone.
 - **External pins (`--with-external`) are tried as one unit, before any
   sibling target.** All of a repo's stale external inputs are checked
   together as a single step; if that step fails `nix flake check`, only the

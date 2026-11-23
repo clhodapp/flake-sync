@@ -3,6 +3,7 @@
   lib,
   writeShellApplication,
   coreutils,
+  findutils,
   gawk,
   gh,
   git,
@@ -21,6 +22,7 @@ writeShellApplication {
   # present.
   runtimeInputs = [
     coreutils
+    findutils
     gawk
     gh
     git

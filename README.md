@@ -17,13 +17,28 @@ that no longer build. flake-sync works out the order from the repos
 themselves and runs it.
 
 ```sh
-flake-sync status      # git and pin state of every repo, pending actions
-flake-sync converge    # run ready actions until converged or blocked
-flake-sync check       # read-only nix flake check sweep over every repo
-flake-sync pull        # down-sync a checkout the remotes moved past
-flake-sync pull --heads  # ...to the remotes' tips, ahead of the recorded pointers
-flake-sync graph       # the dependency DAG in topological order
+flake-sync status            # git and pin state of every repo, pending actions
+flake-sync converge          # run ready actions until converged or blocked
+flake-sync converge --local  # advance working-tree locks only; publish nothing
+flake-sync check             # read-only nix flake check sweep over every repo
+flake-sync pull              # down-sync a checkout the remotes moved past
+flake-sync pull --heads      # ...to the remotes' tips, ahead of the recorded pointers
+flake-sync graph             # the dependency DAG in topological order
+flake-sync checkout <repo>   # add a submodule to a checkout that holds only some
+flake-sync override-inputs <ref>  # a flake ref plus overrides to the remote heads
+flake-sync unmerged-commits  # changes not on the default branches, in pull request order
+flake-sync pr <repo> …       # open or update a pull request, a draft until it can merge
+flake-sync rebase <repo>     # rebase a topic branch onto the converged default branch
 ```
+
+A change in one repo that another repo needs goes through pull requests
+in dependency order: `unmerged-commits` gives the order and says which
+pull requests can leave draft, and `pr` keeps a pull request a draft
+until its default branch pins the merged dependencies. Lock changes are
+not part of those pull requests; convergence makes them on the default
+branches. A converge run outside CI merges them through separate pull
+requests that hold only lock changes and are merged at once; CI
+convergence pushes them directly.
 
 ## Install
 
@@ -46,8 +61,8 @@ version:
 ```
 
 `nix profile install github:clhodapp/flake-sync` puts it on `PATH`
-permanently. It needs `git` and `nix` at runtime, both of which the
-package carries in its closure.
+permanently. The package carries every program it runs, `git`, `nix`
+and `gh` included.
 
 The workspace is found from the current directory: the enclosing git
 repo, walked up to the parent-most repo that tracks it as a submodule. A
@@ -102,11 +117,8 @@ them.
 
 ## Stability
 
-`main` rolls. There are no tagged releases, and the command surface may
-change; pin a revision if you need one that stays put. The command names
-and their exit-status conventions (`converge` exiting 1 to report
-blockers rather than to signal a crash) are the parts least likely to
-move.
+There are no releases, and commands and flags can change on `main`. To
+keep a fixed version, pin a revision.
 
 ## License
 
