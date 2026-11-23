@@ -48,8 +48,7 @@ Run it without installing anything:
 nix run github:clhodapp/flake-sync -- status
 ```
 
-Add it to a dev shell, so everyone working in the workspace has the same
-version:
+Or add it to the workspace's dev shell:
 
 ```nix
 {
@@ -59,6 +58,12 @@ version:
   #   packages = [ inputs.flake-sync.packages.${system}.flake-sync ];
 }
 ```
+
+The workspace's `flake.lock` then decides the version everyone in the
+workspace runs, and updating the input moves it forward, with
+`nix flake update flake-sync` or whatever routine updates the
+workspace's other inputs. `flake-sync --latest-flake-sync <command>`
+runs the head of `main` without changing the lock.
 
 The `flake-sync-skills` package holds agent skills for setting up and
 working in a flake-sync workspace (`flake-sync-new-workspace`,
@@ -128,8 +133,10 @@ them.
 
 ## Stability
 
-There are no releases, and commands and flags can change on `main`. To
-keep a fixed version, pin a revision.
+flake-sync is versioned by commit on `main`, and commands and flags can
+change between commits. A lock that pins flake-sync keeps its commit
+until the input is updated; `flake-sync --help` and the reference
+describe the version in use.
 
 ## License
 
