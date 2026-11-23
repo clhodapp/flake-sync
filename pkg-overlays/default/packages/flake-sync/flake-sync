@@ -73,6 +73,14 @@ Commands:
               full builds the checks); --with-partitions also checks
               partition/dev input flakes
   graph       Print the dependency DAG in topological order
+  checkout <repo>... | --all
+              Clone the named submodules that are not checked out here,
+              or with --all every one, and attach each to its default
+              branch at the recorded pointer (with --heads: at origin's
+              tip). Every other command reads a submodule that is not
+              checked out from its remote: pins onto it are managed, and
+              converge bumps its pointer, but advancing the stale pins in
+              its locks needs a checkout (see --checkout-missing)
   override-inputs <flake-ref>
               Print <flake-ref>, then an `--override-input` flag for every
               input in its lock, at any depth, that pins a workspace repo
@@ -113,7 +121,7 @@ Options:
                         its default branch and its checked-out branch's
                         upstream, or everything when HEAD is then on no
                         remote-tracking ref
-      --heads           (pull only) Sync each submodule to origin/<default>
+      --heads           (pull, checkout) Sync each submodule to origin/<default>
                         rather than to the pointer the workspace records.
                         The pointers lag the remotes until convergence
                         runs; this reaches the remotes' state directly, so
@@ -127,6 +135,13 @@ Options:
                         agent worktrees. Pins still advance only to pushed
                         sibling revs, so the locks written are exactly the
                         ones CI convergence will commit
+      --checkout-missing
+                        (converge, step) Clone a submodule that is not
+                        checked out here when it has a stale pin that can
+                        advance now, then advance it. Without it, such a
+                        submodule blocks convergence and converge exits 1;
+                        one whose stale pins wait on unpushed targets is
+                        never cloned
       --with-partitions Also manage partition/dev input flakes: every tracked
                         flake.lock below a repo's root (e.g. tests/dependencies)
                         joins staleness detection and update-pins
@@ -188,6 +203,8 @@ DRY_RUN=false
 DO_FETCH=false
 HEADS=false
 LOCAL=false
+CHECKOUT_MISSING=false
+CHECKOUT_ALL=false
 WITH_PARTITIONS=false
 WITH_TESTS=false
 WITH_EXTERNAL=false
@@ -247,6 +264,10 @@ declare -A EXTSTALE=()   # "repo<TAB>input<TAB>flakedir" -> "stale" or "ok" (pop
 declare -A EXTURL=()     # same key -> exact-rev override ref for a stale external pin (resolved by its trial lock)
 declare -A DEPS=()       # repo -> space-separated dep repo names
 declare -A STALE_PTR=()  # workspace only: lines "repo<TAB>recorded-rev"
+declare -A ABSENT=()     # repo -> path, for a submodule that is not checked out here
+declare -A ABSENTURL=()  # repo -> its remote URL from .gitmodules
+declare -A ABSENT_READ=() # repo -> 1 once read_absent_state has read it
+declare -A ABSENTBRANCH=() # repo -> its remote's default branch, when known
 TOPO=()
 
 gh_slug() { # normalize a github remote URL to owner/repo, empty otherwise
@@ -283,12 +304,18 @@ discover_repos() {
   local key path url name
   while read -r key path; do
     name=$(basename "$path")
-    [ -f "$ROOT/$path/flake.nix" ] || continue
-    [ -e "$ROOT/$path/.git" ] || { echo "${C_YLW}warning: submodule $path not initialized; skipping${C_OFF}" >&2; continue; }
     [ "$name" != "$WS" ] || die "submodule name collides with workspace name '$WS'"
-    DIR[$name]=$ROOT/$path
-    SUBPATH[$name]=$path
     url=$(git config -f "$ROOT/.gitmodules" "${key%.path}.url")
+    if [ -e "$ROOT/$path/.git" ]; then
+      [ -f "$ROOT/$path/flake.nix" ] || continue
+      DIR[$name]=$ROOT/$path
+    else
+      # Not checked out here: read_absent_state reads it from its remote,
+      # and drops it there if it is not a flake.
+      ABSENT[$name]=$path
+      ABSENTURL[$name]=$url
+    fi
+    SUBPATH[$name]=$path
     local slug; slug=$(gh_slug "$url")
     if [ -n "$slug" ]; then
       GH2REPO[$slug]=$name
@@ -303,6 +330,75 @@ discover_repos() {
     fi
   done < <(git config -f "$ROOT/.gitmodules" --get-regexp '^submodule\..*\.path$')
   return 0
+}
+
+fetch_absent() { # write absent repo $1's head rev and source store path to $EXTTMP/absent-$1.*
+  local repo=$1 out=$EXTTMP/absent-$1 rev="" ref heads=""
+  # With --fetch, the head of its remote; otherwise the recorded pointer,
+  # the newest commit the checkout knows without the network.
+  if $DO_FETCH; then
+    heads=$(git ls-remote --symref "${ABSENTURL[$repo]}" HEAD 2>/dev/null || true)
+    rev=$(awk '$2 == "HEAD" && $1 != "ref:" { print $1 }' <<<"$heads")
+    awk '$1 == "ref:" { sub("^refs/heads/", "", $2); print $2 }' <<<"$heads" >"$out.branch"
+    [ -n "$rev" ] || echo "${C_YLW}warning: fetch failed for $repo; using the recorded pointer${C_OFF}" >&2
+  fi
+  [ -n "$rev" ] || rev=$(git -C "$ROOT" ls-tree HEAD -- "${ABSENT[$repo]}" | awk '{print $3}')
+  echo "$rev" >"$out.rev"
+  [ -n "$rev" ] || return 0
+  case ${PINBASE[$repo]} in
+    github:*) ref=${PINBASE[$repo]}/$rev ;;
+    *) ref="${PINBASE[$repo]}?rev=$rev" ;;
+  esac
+  nix flake prefetch --json "$ref" >"$out.json" 2>"$out.err" || true
+}
+
+read_absent_state() { # state of absent repo $1 from the files fetch_absent wrote
+  local repo=$1 out=$EXTTMP/absent-$1 rev src sub fd
+  rev=$(cat "$out.rev")
+  if [ -z "$rev" ]; then # in .gitmodules but not in the tree
+    unset "ABSENT[$repo]" "SUBPATH[$repo]"
+    return 0
+  fi
+  src=$(jq -r '.storePath // empty' "$out.json" 2>/dev/null || true)
+  if [ -n "$src" ] && [ ! -f "$src/flake.nix" ]; then # not a flake, as for a checked-out one
+    unset "ABSENT[$repo]" "SUBPATH[$repo]"
+    return 0
+  fi
+  HEADREV[$repo]=$rev
+  BRANCH[$repo]="(not checked out)"
+  [ ! -s "$out.branch" ] || ABSENTBRANCH[$repo]=$(cat "$out.branch")
+  AHEAD[$repo]=0 BEHIND[$repo]=0 HAS_UPSTREAM[$repo]=no
+  DIRTY[$repo]="" LOCK_DIRTY[$repo]=no
+  PINS[$repo]='' DEPS[$repo]='' EXTPINS[$repo]=''
+  ABSENT_READ[$repo]=1
+  if [ -z "$src" ]; then
+    echo "${C_YLW}warning: cannot fetch $repo at ${rev:0:12}, so its pins are not assessed: $(tail -1 "$out.err")${C_OFF}" >&2
+    return 0
+  fi
+  read_lock_pins "$repo" "$src/flake.lock" "."
+  if $WITH_PARTITIONS; then
+    while IFS= read -r sub; do
+      fd=${sub#"$src"/}; fd=$(dirname "$fd")
+      [ -f "$src/$fd/flake.nix" ] || continue
+      read_lock_pins "$repo" "$sub" "$fd"
+    done < <(find "$src" -mindepth 2 -name flake.lock | sort)
+  fi
+}
+
+read_absent_states() { # fetch every unread absent repo, in parallel, then read each
+  local repo todo=()
+  for repo in ${ABSENT[@]+"${!ABSENT[@]}"}; do
+    [ -n "${ABSENT_READ[$repo]:-}" ] || todo+=("$repo")
+  done
+  [ ${#todo[@]} -gt 0 ] || return 0
+  ext_tmpdir >/dev/null
+  echo "reading ${#todo[@]} repo(s) not checked out here from their remotes..." >&2
+  for repo in "${todo[@]}"; do
+    while [ "$(jobs -rp | wc -l)" -ge "$FETCH_JOBS" ]; do wait -n || true; done
+    fetch_absent "$repo" &
+  done
+  wait || true
+  for repo in "${todo[@]}"; do read_absent_state "$repo"; done
 }
 
 read_git_state() {
@@ -425,6 +521,7 @@ read_pointer_state() { # workspace submodule pointers vs submodule HEADs
   STALE_PTR[$WS]=''
   local repo recorded
   for repo in "${!SUBPATH[@]}"; do
+    [ -n "${HEADREV[$repo]:-}" ] || continue # absent and unread (pull)
     recorded=$(git -C "$ROOT" ls-tree HEAD -- "${SUBPATH[$repo]}" | awk '{print $3}')
     if [ -n "$recorded" ] && [ "$recorded" != "${HEADREV[$repo]}" ]; then
       STALE_PTR[$WS]+="$repo	$recorded"$'\n'
@@ -434,6 +531,8 @@ read_pointer_state() { # workspace submodule pointers vs submodule HEADs
 
 is_pushed() { # is $2 (default HEAD) of repo $1 reachable from some remote ref?
   local rev=${2:-${HEADREV[$1]}}
+  # An absent repo's head is read from its remote or the recorded pointer.
+  [ -z "${ABSENT[$1]:-}" ] || return 0
   [ "$(git -C "${DIR[$1]}" rev-list --count "$rev" --not --remotes)" = 0 ]
 }
 
@@ -442,7 +541,7 @@ toposort() {
   # submodule (pointer bumps must come last).
   local -A remaining=()
   local repo dep progressed
-  for repo in "${!DIR[@]}"; do
+  for repo in "${!DIR[@]}" ${ABSENT[@]+"${!ABSENT[@]}"}; do
     local deps="${DEPS[$repo]:-}"
     [ "$repo" = "$WS" ] && for dep in "${!SUBPATH[@]}"; do deps+="$dep "; done
     remaining[$repo]=$deps
@@ -465,6 +564,15 @@ toposort() {
 
 refresh_state() { # re-read git/pin state for every repo (after a mutating action, or for the initial load)
   local repo
+  # An absent repo that an action checked out joins the checked-out ones.
+  for repo in ${ABSENT[@]+"${!ABSENT[@]}"}; do
+    if [ -e "$ROOT/${ABSENT[$repo]}/.git" ]; then
+      DIR[$repo]=$ROOT/${ABSENT[$repo]}
+      unset "ABSENT[$repo]" "ABSENT_READ[$repo]"
+    fi
+  done
+  # pull clones or leaves out absent submodules itself, from .gitmodules.
+  [ "$CMD" = pull ] || read_absent_states
   for repo in "${!DIR[@]}"; do
     read_git_state "$repo"
     read_pins "$repo"
@@ -591,7 +699,16 @@ build_plan() {
       # only itself: sibling pins still advance, with nix flake check
       # arbitrating which partial states are publishable. Dirty trees and
       # detached HEADs only endanger commits, so --local ignores them.
-      if ! $LOCAL && [ -n "${DIRTY[$repo]}" ]; then
+      if [ -n "${ABSENT[$repo]:-}" ]; then
+        # Advancing needs a checkout; pins that cannot advance do not.
+        if [ -z "$ready" ] && [ -z "$extready" ]; then
+          PLAN+=("BLOCKED|update-pins|$repo|stale pin(s) to unpushed target(s): $blockednames")
+        elif $CHECKOUT_MISSING; then
+          PLAN+=("READY|checkout|$repo|not checked out here; clone it to advance pins: $names")
+        else
+          PLAN+=("BLOCKED|update-pins|$repo|stale pins ($names) but not checked out here; rerun with --checkout-missing, or run 'flake-sync checkout $repo'")
+        fi
+      elif ! $LOCAL && [ -n "${DIRTY[$repo]}" ]; then
         PLAN+=("BLOCKED|update-pins|$repo|stale pins (${names:-$blockednames}) but repo has ${DIRTY[$repo]}")
       elif ! $LOCAL && [ "${BRANCH[$repo]}" = "(detached)" ]; then
         PLAN+=("BLOCKED|update-pins|$repo|stale pins (${names:-$blockednames}) but HEAD is detached; check out a branch")
@@ -667,7 +784,11 @@ pin_override_args() { # print --override-input args (one per line) for pins of f
       github:*) ref="$base/${HEADREV[$target]}" ;;
       *)
         ref="$base?rev=${HEADREV[$target]}"
-        [ "${BRANCH[$target]}" != "(detached)" ] && ref+="&ref=refs/heads/${BRANCH[$target]}"
+        if [ -n "${ABSENT[$target]:-}" ]; then
+          [ -z "${ABSENTBRANCH[$target]:-}" ] || ref+="&ref=refs/heads/${ABSENTBRANCH[$target]}"
+        elif [ "${BRANCH[$target]}" != "(detached)" ]; then
+          ref+="&ref=refs/heads/${BRANCH[$target]}"
+        fi
         ;;
     esac
     printf '%s\n' --override-input "$input" "$ref"
@@ -852,17 +973,38 @@ do_push() {
 
 do_bump_submodules() {
   ! $LOCAL || die "bump-submodules is publication; --local touches working trees only"
-  local paths=() names=() sub
+  local paths=() names=() infos=() sub
   while IFS=$'\t' read -r sub _; do
     [ -n "$sub" ] || continue
     is_pushed "$sub" || continue
     paths+=("${SUBPATH[$sub]}"); names+=("$sub")
+    infos+=(--cacheinfo "160000,${HEADREV[$sub]},${SUBPATH[$sub]}")
   done <<<"${STALE_PTR[$WS]:-}"
   [ ${#paths[@]} -gt 0 ] || die "no pushed submodule pointers to bump"
-  local msg
+  local msg idx
   msg="maint: bump $(IFS=,; echo "${names[*]}")"
-  run git -C "$ROOT" commit --quiet -m "$msg" -- "${paths[@]}"
+  # The commit is built from an index holding HEAD plus the new pointers, so
+  # nothing else staged joins it, and a pointer is recorded whether or not
+  # its submodule is checked out here.
+  ext_tmpdir >/dev/null
+  idx=$EXTTMP/bump-index
+  run env GIT_INDEX_FILE="$idx" git -C "$ROOT" read-tree HEAD
+  run env GIT_INDEX_FILE="$idx" git -C "$ROOT" update-index "${infos[@]}"
+  run env GIT_INDEX_FILE="$idx" git -C "$ROOT" commit --quiet -m "$msg"
+  run git -C "$ROOT" update-index "${infos[@]}"
   echo "${C_GRN}recorded submodule pointer(s): ${names[*]}${C_OFF}"
+}
+
+do_checkout() { # clone absent submodule $1 and attach it to its default branch, at origin's tip with $2 = heads, else at the recorded pointer
+  local repo=$1 path=${ABSENT[$1]:-}
+  [ -n "$path" ] || die "$repo is already checked out"
+  run git -C "$ROOT" submodule --quiet update --init -- "$path" || die "cloning $repo failed"
+  $DRY_RUN && return 0
+  local HEADS=false PULL_SYNCED=0 PULL_HELD=() PULL_NOTES=() # read and written by pull_sub
+  [ "${2:-}" != heads ] || HEADS=true
+  pull_sub "$path" HEAD
+  [ ${#PULL_HELD[@]} -eq 0 ] || die "checked out $repo but could not attach it: ${PULL_HELD[*]}"
+  echo "${C_GRN}checked out $repo at $path, on its default branch at $($HEADS && echo "origin's tip" || echo "the recorded pointer")${C_OFF}"
 }
 
 run_action() {
@@ -871,6 +1013,8 @@ run_action() {
     update-pins) do_update_pins "$repo" ;;
     push) do_push "$repo" ;;
     bump-submodules) do_bump_submodules ;;
+    # converge advances from the remote heads, so the clone starts there
+    checkout) do_checkout "$repo" heads ;;
     *) die "unknown action '$action'" ;;
   esac
 }
@@ -913,6 +1057,7 @@ cmd_status() {
   printf "${C_BLD}%-22s %-22s %-24s %s${C_OFF}\n" REPO BRANCH GIT "LOCAL PINS"
   for repo in "${TOPO[@]}"; do
     git=""
+    [ -z "${ABSENT[$repo]:-}" ] || git="${C_YLW}not checked out${C_OFF} "
     [ -n "${DIRTY[$repo]}" ] && git+="${C_RED}dirty${C_OFF} "
     [ "${LOCK_DIRTY[$repo]}" = yes ] && git+="${C_YLW}lock-dirty${C_OFF} "
     if [ "${AHEAD[$repo]}" -gt 0 ]; then git+="${C_YLW}ahead ${AHEAD[$repo]}${C_OFF} "; fi
@@ -1000,10 +1145,10 @@ cmd_step() {
     0) ;;
     1)
       if [ "$1" = bump-submodules ]; then action=$1 target=$WS
-      elif [ -n "${DIR[$1]:-}" ]; then target=$1
+      elif [ -n "${DIR[$1]:-}${ABSENT[$1]:-}" ]; then target=$1
       else die "'$1' is neither a repo nor 'bump-submodules'"
       fi ;;
-    2) action=$1 target=$2; [ -n "${DIR[$target]:-}" ] || die "unknown repo '$target'" ;;
+    2) action=$1 target=$2; [ -n "${DIR[$target]:-}${ABSENT[$target]:-}" ] || die "unknown repo '$target'" ;;
     *) usage >&2; exit 2 ;;
   esac
   if [ -n "$action" ]; then
@@ -1248,7 +1393,7 @@ cmd_pull() {
   done < <(git config -f "$ROOT/.gitmodules" --get-regexp '^submodule\..*\.path$')
   echo
   if [ ${#PULL_ABSENT[@]} -gt 0 ]; then
-    echo "not checked out here, left alone: ${PULL_ABSENT[*]} (git submodule update --init <path> adds one)"
+    echo "not checked out here, left alone: ${PULL_ABSENT[*]} (flake-sync checkout <repo> adds one)"
   fi
   local n
   for n in ${PULL_NOTES[@]+"${PULL_NOTES[@]}"}; do echo "${C_YLW}note: $n${C_OFF}"; done
@@ -1273,15 +1418,18 @@ cmd_check() {
   local target=""
   case $# in
     0) ;;
-    1) target=$1; [ -n "${DIR[$target]:-}" ] || die "unknown repo '$1'" ;;
+    1) target=$1
+       [ -z "${ABSENT[$target]:-}" ] || die "$target is not checked out here (flake-sync checkout $target adds it)"
+       [ -n "${DIR[$target]:-}" ] || die "unknown repo '$1'" ;;
     *) usage >&2; exit 2 ;;
   esac
   [ "$CHECK_MODE" != none ] || die "check with --check=none would check nothing (use eval or full)"
   local check_flags=(--no-write-lock-file)
   [ "$CHECK_MODE" = eval ] && check_flags+=(--no-build)
-  local repo dir sub fd flakedir label passed=0 failed=()
+  local repo dir sub fd flakedir label passed=0 failed=() absent=()
   for repo in "${TOPO[@]}"; do
     [ -z "$target" ] || [ "$repo" = "$target" ] || continue
+    if [ -n "${ABSENT[$repo]:-}" ]; then absent+=("$repo"); continue; fi
     dir=${DIR[$repo]}
     local fds=(".")
     if $WITH_PARTITIONS; then
@@ -1305,6 +1453,7 @@ cmd_check() {
   [ $((passed + ${#failed[@]})) -gt 0 ] || die "no flakes to check"
   $DRY_RUN && return 0
   echo
+  [ ${#absent[@]} -eq 0 ] || echo "not checked out here, so not checked: ${absent[*]}"
   if [ ${#failed[@]} -eq 0 ]; then
     echo "${C_GRN}All checks passed: $passed flake(s), --check=$CHECK_MODE.${C_OFF}"
   else
@@ -1392,6 +1541,28 @@ cmd_override_inputs() { # print flake ref $1 and the --override-input flags that
   printf '%s\n' "${out[*]}"
 }
 
+cmd_checkout() { # clone the named absent submodules, or with --all every one
+  local repo targets=()
+  if $CHECKOUT_ALL; then
+    [ $# -eq 0 ] || die "checkout takes repo names or --all, not both"
+    for repo in ${ABSENT[@]+"${!ABSENT[@]}"}; do targets+=("$repo"); done
+    [ ${#targets[@]} -gt 0 ] || { echo "every submodule is checked out here"; return 0; }
+  else
+    [ $# -gt 0 ] || die "checkout needs repo names, or --all for every submodule not checked out here"
+    for repo in "$@"; do
+      if [ -n "${ABSENT[$repo]:-}" ]; then targets+=("$repo")
+      elif [ -n "${DIR[$repo]:-}" ]; then echo "$repo is already checked out"
+      else die "unknown repo '$repo'"
+      fi
+    done
+  fi
+  local failed=()
+  for repo in $(printf '%s\n' ${targets[@]+"${targets[@]}"} | sort); do
+    ( do_checkout "$repo" "$($HEADS && echo heads)" ) || failed+=("$repo")
+  done
+  [ ${#failed[@]} -eq 0 ] || die "checkout failed for: ${failed[*]}"
+}
+
 cmd_graph() {
   local repo dep
   echo "topological order (dependencies first):"
@@ -1416,10 +1587,11 @@ for arg in "$@"; do
     --fetch) DO_FETCH=true ;;
     --heads) HEADS=true ;;
     --local) LOCAL=true ;;
+    --checkout-missing) CHECKOUT_MISSING=true ;;
     --with-partitions) WITH_PARTITIONS=true ;;
     --with-tests) WITH_TESTS=true ;;
     --with-external) WITH_EXTERNAL=true ;;
-    --all) WITH_PARTITIONS=true WITH_TESTS=true WITH_EXTERNAL=true ;;
+    --all) WITH_PARTITIONS=true WITH_TESTS=true WITH_EXTERNAL=true CHECKOUT_ALL=true ;;
     --latest-flake-sync) ;; # handled before anything else; reaching here means this is that copy
     -h | --help) usage; exit 0 ;;
     -*) die "unknown option '$arg' (see --help)" ;;
@@ -1432,7 +1604,15 @@ command -v jq >/dev/null || die "jq is required"
 
 # pull without fetching would sync to yesterday's remote state
 [ "$CMD" != pull ] || DO_FETCH=true
-[ "$CMD" = pull ] || ! $HEADS || die "--heads applies to pull only"
+case $CMD in pull | checkout) ;; *) ! $HEADS || die "--heads applies to pull and checkout only" ;; esac
+[ "$CMD" != checkout ] || ! $CHECKOUT_MISSING || die "--checkout-missing applies to converge, step, next and status"
+
+# checkout needs only the list of submodules and which are checked out.
+if [ "$CMD" = checkout ]; then
+  discover_repos
+  cmd_checkout "${ARGS[@]}"
+  exit 0
+fi
 
 # override-inputs reads only .gitmodules, the flake and the remotes, so it needs
 # none of the working-tree state.

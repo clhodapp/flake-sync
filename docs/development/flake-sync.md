@@ -142,7 +142,7 @@ it to the recorded pointer. A checkout may hold only some submodules: one
 that is not registered in the workspace's `.git/config`, such as after
 `git submodule deinit`, is left out, not counted as held, and named in a
 closing note. A submodule newly added to `.gitmodules` is not registered
-yet either, so it too stays out until `git submodule update --init <path>`.
+yet either, so it too stays out until `flake-sync checkout <repo>`.
 Everything moves by fast-forward only, and the hold-backs mirror
 `converge`'s per-repo style: a submodule that is dirty (when files would
 have to move), whose default branch has diverged from the pointer, or
@@ -174,6 +174,40 @@ convergence commits. A convergence runner does the same before it
 converges, so `pull --heads` is that step as well. The pointers a
 `--heads` sync leaves behind are noted, not held; convergence records
 them when it lands.
+
+## A checkout with only some submodules
+
+```sh
+flake-sync checkout <repo>...
+flake-sync checkout --all
+flake-sync --fetch --checkout-missing converge
+```
+
+Every submodule in `.gitmodules` is a workspace repo, whether or not this
+checkout holds it. A submodule that is not checked out is read from its
+remote: its head is the remote's default-branch head with `--fetch`, and
+the recorded pointer otherwise, and its locks (partition locks too, with
+`--with-partitions`) come from that commit, fetched by
+`nix flake prefetch`, 8 at a time. `status` lists it as `not checked
+out`, and `graph` keeps it in the DAG.
+
+Pins onto such a repo are managed as usual: its head is pushed by
+definition, so `converge` re-pins the checked-out consumers onto it, and
+bumps its workspace pointer without a checkout. A stale pin *of* the repo
+needs a checkout to advance. Without `--checkout-missing`, `converge`
+advances everything else and then fails, naming the repo and the flag.
+With it, `converge` clones the repo, attaches it to its default branch at
+the remote's tip, and advances it. Only a repo with a pin that can
+advance now is cloned; one whose stale pins wait on unpushed targets
+stays out, since a checkout would not let it move. flake-sync tells the
+two apart from the lock it read from the remote.
+
+`checkout` clones the named submodules, or with `--all` every one that is
+not checked out here, and attaches each to its default branch at the
+recorded pointer (`--heads`: at `origin`'s tip), the state `pull` leaves a
+submodule in. `check` skips a repo that is not checked out and names it.
+`pull` is the exception to all of this: it reads only git's registration,
+as described under `pull`.
 
 ## Local convergence: check and accelerate, publish nothing
 

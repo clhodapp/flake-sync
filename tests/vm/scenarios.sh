@@ -727,4 +727,68 @@ $FS pull >/dev/null
 [ -e projects/machines/.git ] || fail "pull should clone a submodule registered with git submodule init"
 echo "ok: pull clones a submodule that is registered but not cloned"
 
+echo "=== 22. the other commands treat a submodule that is not checked out as a workspace repo read from its remote"
+# Earlier --local runs leave advanced, uncommitted locks in app and the
+# workspace; the committed locks are the ones an absent app is read from.
+git -C projects/app checkout -q -- flake.lock
+git checkout -q -- flake.lock
+# Scenario 20 moved machines on the hub, past the recorded pointer.
+$FS --heads pull >/dev/null 2>&1 || fail "test setup: pull --heads should sync to the hub tips"
+out=$($FS --fetch converge 2>&1) || { printf 'output was:\n%s\n' "$out" >&2; fail "test setup: the workspace should converge before scenario 22"; }
+git submodule deinit -q -f projects/app
+# app moves on the hub while its lib pin stays current: machines and the
+# workspace pointer go stale, and app can stay out.
+elsewhere=$(mktemp -d)
+git clone -q "file://$HUB/app.git" "$elsewhere/app"
+echo moved >"$elsewhere/app/moved.txt"
+git -C "$elsewhere/app" add moved.txt
+git -C "$elsewhere/app" commit -qm "feat: app moves elsewhere"
+git -C "$elsewhere/app" push -q origin main
+out=$($FS --fetch status 2>&1)
+expect_contains "$out" "not checked out" "status lists app as not checked out"
+expect_contains "$out" "app=stale" "status sees machines' pin onto the absent app"
+out=$($FS graph 2>&1)
+expect_contains "$out" "machines              <- app lib" "graph keeps the absent app in the DAG"
+out=$($FS --fetch converge 2>&1) || { printf 'output was:\n%s\n' "$out" >&2; fail "converge should need no checkout of app to re-pin machines onto it"; }
+[ ! -e projects/app/.git ] || fail "converge must not check out app without --checkout-missing"
+[ "$(lock_rev projects/machines app)" = "$(hub_rev app)" ] || fail "machines should pin the hub's app"
+[ "$(git ls-tree HEAD projects/app | awk '{print $3}')" = "$(hub_rev app)" ] || fail "the workspace pointer of the absent app should be bumped"
+[ -z "$(git status --porcelain)" ] || { git status --porcelain >&2; fail "the bump should leave the index matching HEAD"; }
+echo "ok: converge re-pins onto and bumps the pointer of a repo that stays out"
+# lib moves, so app now holds a stale lib pin: advancing it needs a checkout.
+echo again >projects/lib/again.txt
+git -C projects/lib add again.txt
+git -C projects/lib commit -qm "feat: lib moves again"
+git -C projects/lib push -q origin main
+rc=0; out=$($FS --fetch converge 2>&1) || rc=$?
+[ "$rc" -ne 0 ] || fail "converge should fail while the absent app holds a stale pin"
+expect_contains "$out" "stale pins (lib) but not checked out here; rerun with --checkout-missing" "the blocker names the flag"
+[ ! -e projects/app/.git ] || fail "converge must not check out app without --checkout-missing"
+[ "$(lock_rev projects/machines lib)" = "$(hub_rev lib)" ] || fail "machines should still advance its lib pin"
+echo "ok: without --checkout-missing, converge advances the rest and fails on the absent app"
+$FS --fetch --checkout-missing converge >/dev/null 2>&1 || fail "converge --checkout-missing should converge"
+[ "$(git -C projects/app symbolic-ref --short HEAD)" = main ] || fail "the checkout of app should be on main"
+[ "$(lock_rev projects/app lib)" = "$(hub_rev lib)" ] || fail "app should pin the hub's lib"
+assert_converged "converge --checkout-missing checks out app and converges"
+# A pin onto an unpushed target cannot advance, so it causes no clone.
+git submodule deinit -q -f projects/app
+echo unpushed >projects/lib/unpushed.txt
+git -C projects/lib add unpushed.txt
+git -C projects/lib commit -qm "feat: unpushed"
+rc=0; out=$($FS --local --checkout-missing converge 2>&1) || rc=$?
+[ "$rc" -ne 0 ] || fail "converge should report the unpushed lib"
+expect_contains "$out" "update-pins app: stale pin(s) to unpushed target(s): lib" "the absent app is blocked on the unpushed lib"
+[ ! -e projects/app/.git ] || fail "a pin that cannot advance must not cause a checkout"
+echo "ok: --checkout-missing clones only a repo whose pins can advance"
+git -C projects/lib reset -q --hard origin/main
+out=$($FS check 2>&1)
+expect_contains "$out" "not checked out here, so not checked: app" "check names the repo it could not check"
+$FS checkout app >/dev/null
+[ "$(git -C projects/app symbolic-ref --short HEAD)" = main ] || fail "checkout should attach app to main"
+[ "$(head_rev projects/app)" = "$(git ls-tree HEAD projects/app | awk '{print $3}')" ] || fail "checkout should leave app at the recorded pointer"
+git submodule deinit -q -f projects/app projects/machines
+$FS checkout --all >/dev/null
+[ -e projects/app/.git ] && [ -e projects/machines/.git ] || fail "checkout --all should check out every absent submodule"
+assert_converged "checkout --all restores the full checkout"
+
 echo "ALL SCENARIOS PASSED"
