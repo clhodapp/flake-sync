@@ -37,10 +37,14 @@ flake-sync reference.
   lock are converged like those of any other repo, and its submodule
   pointers are bumped last.
 
-Make the tool available the way the workspace provides its other tools,
-such as an input of the workspace's development shell, so contributors and CI
-run the same version; `nix run github:clhodapp/flake-sync -- status` works
-without installing anything.
+Check whether flake-sync is already provided before adding it:
+`command -v flake-sync` shows whether it is on the PATH, and the
+workspace's development shell or the machine's configuration may supply
+it. If nothing does, ask the owner how the workspace should provide it,
+for example as an input of its development shell, so contributors and
+CI run the same version. Until then,
+`nix run github:clhodapp/flake-sync -- <command>` runs it without
+installing anything.
 
 ## Policy questions to settle with the owner
 
