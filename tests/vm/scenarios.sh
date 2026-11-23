@@ -1079,4 +1079,25 @@ echo "ok: rebase keeps the default branch's pins and the branch's new input"
 git -C projects/app checkout -q main
 git -C projects/app branch -q -D add-input
 
+echo "=== 28. a submodule that is not a flake, absent and pinned by an absent repo, counts as external"
+git init -q --bare "$HUB/src.git"
+src_clone=$(mktemp -d)/src
+git clone -q "file://$HUB/src.git" "$src_clone"
+echo source >"$src_clone/README"
+git -C "$src_clone" add README
+git -C "$src_clone" commit -qm "init src"
+git -C "$src_clone" push -q origin main
+git submodule -q add "file://$HUB/src.git" projects/src
+git commit -qm "feat: add the src submodule"
+sed -i "1a\\  inputs.src = { url = \"git+file://$HUB/src.git\"; flake = false; };" projects/app/flake.nix
+nix flake lock "$PWD/projects/app" >/dev/null 2>"$WORK/../src-lock.err" || { cat "$WORK/../src-lock.err" >&2; fail "test setup: locking src"; }
+git -C projects/app commit -qam "feat: use src"
+out=$($FS converge 2>&1) || { printf "output was:\n%s\n" "$out" >&2; fail "test setup: converge with src"; }
+git submodule -q deinit -f projects/src projects/app
+rc=0; out=$($FS --fetch status 2>&1) || rc=$?
+[ "$rc" -eq 0 ] || { printf 'output was:\n%s\n' "$out" >&2; fail "status with the absent non-flake src pinned by the absent app"; }
+case $out in *"src "*) fail "src is not a flake and should not be listed: $out" ;; esac
+echo "ok: an absent non-flake pinned by an absent repo is dropped before any lock is read"
+git submodule -q update --init projects/app projects/src
+
 echo "ALL SCENARIOS PASSED"

@@ -398,18 +398,27 @@ fetch_absent() { # write absent repo $1's head rev and source store path to $EXT
   nix flake prefetch --json "$ref" >"$out.json" 2>"$out.err" || true
 }
 
+absent_dropped() { # is absent repo $1 no workspace flake? (not in the tree, or no flake.nix)
+  local out=$EXTTMP/absent-$1 src
+  [ -n "$(cat "$out.rev")" ] || return 0
+  src=$(jq -r '.storePath // empty' "$out.json" 2>/dev/null || true)
+  [ -n "$src" ] && [ ! -f "$src/flake.nix" ]
+}
+
+drop_absent() { # forget absent repo $1, as discovery skips a checked-out non-flake: pins onto it count as external
+  local repo=$1
+  if [ -n "${SLUG[$repo]:-}" ]; then
+    unset "GH2REPO[${SLUG[$repo]}]" "SLUG[$repo]"
+  else
+    unset "URL2REPO[$(norm_url "${ABSENTURL[$repo]}")]"
+  fi
+  unset "ABSENT[$repo]" "SUBPATH[$repo]" "PINBASE[$repo]"
+}
+
 read_absent_state() { # state of absent repo $1 from the files fetch_absent wrote
   local repo=$1 out=$EXTTMP/absent-$1 rev src sub fd
   rev=$(cat "$out.rev")
-  if [ -z "$rev" ]; then # in .gitmodules but not in the tree
-    unset "ABSENT[$repo]" "SUBPATH[$repo]"
-    return 0
-  fi
   src=$(jq -r '.storePath // empty' "$out.json" 2>/dev/null || true)
-  if [ -n "$src" ] && [ ! -f "$src/flake.nix" ]; then # not a flake, as for a checked-out one
-    unset "ABSENT[$repo]" "SUBPATH[$repo]"
-    return 0
-  fi
   HEADREV[$repo]=$rev
   BRANCH[$repo]="(not checked out)"
   [ ! -s "$out.branch" ] || ABSENTBRANCH[$repo]=$(cat "$out.branch")
@@ -444,7 +453,13 @@ read_absent_states() { # fetch every unread absent repo, in parallel, then read 
     fetch_absent "$repo" &
   done
   wait || true
-  for repo in "${todo[@]}"; do read_absent_state "$repo"; done
+  # Every drop comes first, so no lock read below maps a pin onto a
+  # dropped repo.
+  local keep=()
+  for repo in "${todo[@]}"; do
+    if absent_dropped "$repo"; then drop_absent "$repo"; else keep+=("$repo"); fi
+  done
+  for repo in ${keep[@]+"${keep[@]}"}; do read_absent_state "$repo"; done
 }
 
 read_git_state() {
