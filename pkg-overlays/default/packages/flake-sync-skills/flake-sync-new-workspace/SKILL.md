@@ -5,9 +5,9 @@ description: Set up a new flake-sync workspace, or bring an existing set of flak
 
 # Establishing a flake-sync workspace
 
-Setting up a workspace has two halves: the structure flake-sync reads,
-which is mechanical, and the policy for how changes and pins move, which
-belongs to the workspace's owner. Settle the policy with the owner
+Setting up a workspace means getting the structure flake-sync reads
+right, which is mechanical, and settling the policy for how changes and
+pins move, which belongs to the workspace's owner. Settle the policy with the owner
 rather than choosing it, and write the answers into the workspace's
 instructions for agents and contributors, where the other flake-sync
 skills look for them. `reference.md` beside this file is the full
@@ -38,8 +38,8 @@ flake-sync reference.
   pointers are bumped last.
 
 Make the tool available the way the workspace provides its other tools,
-such as an input of the workspace's development shell, so everyone runs
-the same version; `nix run github:clhodapp/flake-sync -- status` works
+such as an input of the workspace's development shell, so contributors and CI
+run the same version; `nix run github:clhodapp/flake-sync -- status` works
 without installing anything.
 
 ## Policy questions to settle with the owner
@@ -48,7 +48,7 @@ Ask these, explain the consequences below, and record the answers.
 
 1. **Who publishes convergence?** CI, by running `flake-sync --fetch
    converge` after pushes to default branches (it needs credentials that
-   can push to every repo), or people and agents running `converge` from
+   can push to the workspace's repos), or people and agents running `converge` from
    a primary checkout, or both, with CI as the routine path. Where CI
    publishes, local runs usually stop at `converge --local`.
 2. **How do pin commits reach default branches outside CI?** flake-sync
@@ -64,7 +64,7 @@ Ask these, explain the consequences below, and record the answers.
    which merge methods the repos allow.
 4. **Which pins does routine convergence move?** Root locks only, or
    partition locks too (`--with-partitions`). External inputs such as
-   nixpkgs (`--with-external`) change what everything builds against;
+   nixpkgs (`--with-external`) change what the workspace builds against;
    decide whether they move on a schedule, only on request, or never
    through flake-sync.
 5. **How deep is the check gate?** `--check=eval` (the default) catches
@@ -78,10 +78,10 @@ Ask these, explain the consequences below, and record the answers.
 
 ## Checking the result
 
-- `flake-sync --fetch status` lists every repo with its pins; a sibling
+- `flake-sync --fetch status` lists the repos with their pins; a sibling
   that shows no pins where one is expected usually has an input that
   names it by another URL.
 - `flake-sync graph` prints the dependency order.
-- `flake-sync check` runs the check gate over every repo as it stands.
+- `flake-sync check` runs the check gate over the repos as they stand.
 - `flake-sync --fetch converge --local` shows whether the workspace
   converges from here, without publishing anything.

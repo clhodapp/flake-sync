@@ -5,7 +5,7 @@
 #
 # The workspace is found from the caller's cwd: the enclosing git repo,
 # walked up to the parent-most repo that tracks it as a submodule (a repo
-# that is nobody's submodule is a workspace by itself; a cwd outside any
+# that is not a submodule of another repo is a workspace by itself; a cwd outside any
 # git repo is an error).
 #
 # The workspace is a git repo with flake submodules that pin each other via
@@ -53,21 +53,21 @@ usage() {
 Usage: flake-sync <command> [options]
 
 Commands:
-  status      Show git and pin state of every repo, plus pending actions
+  status      Show the git and pin state of the repos, plus pending actions
   next        Print the next action that would run, without running it
   step        Run the next ready action (or a specific one, see below)
   converge    Run ready actions until converged or blocked (with --local:
               working trees only: advance locks, commit and push nothing)
   pull        Down-sync from the remotes: fetch, fast-forward the workspace
               to its upstream, clone registered submodules that are not
-              cloned (unregistered ones stay out), then re-attach every
+              cloned (unregistered ones stay out), then re-attach each
               checked-out submodule to its default branch fast-forwarded to the recorded
               pointer, leaving no detached HEADs behind. A submodule that is
               dirty, diverged, or parked on a topic branch is held (and
               reported) rather than touched; exit 1 if anything held.
               With --heads: to origin's tip of the default branch instead
               of the recorded pointer, the state convergence starts from
-  check       Run `nix flake check` on every repo (or one: `check <repo>`)
+  check       Run `nix flake check` on each repo (or one: `check <repo>`)
               against its current locks, read-only: nothing is re-pinned,
               committed, or pushed. Depth follows --check (eval by default,
               full builds the checks); --with-partitions also checks
@@ -99,9 +99,9 @@ Commands:
               stops for resolution by hand
   checkout <repo>... | --all
               Clone the named submodules that are not checked out here,
-              or with --all every one, and attach each to its default
+              or with --all all of them, and attach each to its default
               branch at the recorded pointer (with --heads: at origin's
-              tip). Every other command reads a submodule that is not
+              tip). The other commands read a submodule that is not
               checked out from its remote: pins onto it are managed, and
               converge bumps its pointer, but advancing the stale pins in
               its locks needs a checkout (see --checkout-missing).
@@ -110,7 +110,7 @@ Commands:
               keeps for the submodule, on a branch named after the
               workspace worktree's branch, from origin's tip
   override-inputs <flake-ref>
-              Print <flake-ref>, then an `--override-input` flag for every
+              Print <flake-ref>, then an `--override-input` flag for each
               input in its lock, at any depth, that pins a workspace repo
               at a commit other than the head of that repo's remote,
               moving it to that head. External inputs are left out. It
@@ -145,9 +145,9 @@ Options:
                         whatever passes advances in one commit. The same
                         mode picks the depth of the `check` command (none
                         is rejected there)
-      --fetch           Fetch every repo before assessing state, 8 at a time:
+      --fetch           Fetch the repos before assessing state, 8 at a time:
                         its default branch and its checked-out branch's
-                        upstream, or everything when HEAD is then on no
+                        upstream, or all refs when HEAD is then on no
                         remote-tracking ref
       --heads           (pull, checkout) Sync each submodule to origin/<default>
                         rather than to the pointer the workspace records.
@@ -156,7 +156,7 @@ Options:
                         `converge --local` can run from it. It is the step
                         a convergence runner takes before converging
       --local           Touch working trees only: advance pins through the
-                        same check gate, but never commit, push, or bump
+                        same check gate, but do not commit, push, or bump
                         submodule pointers. Runs with dirty trees and on
                         detached HEADs (with no commits, nothing can
                         strand), so it works in any checkout, including
@@ -179,8 +179,8 @@ Options:
                         advance now, then advance it. Without it, such a
                         submodule blocks convergence and converge exits 1;
                         one whose stale pins wait on unpushed targets is
-                        never cloned
-      --with-partitions Also manage partition/dev input flakes: every tracked
+                        not cloned
+      --with-partitions Also manage partition/dev input flakes: the tracked
                         flake.lock below a repo's root (e.g. tests/dependencies)
                         joins staleness detection and update-pins
       --with-tests      Also check always-unlocked test flakes (flake.nix with a
@@ -206,12 +206,12 @@ Options:
 
 The workspace is found from the current directory: the enclosing git repo,
 walked up to the parent-most repo that tracks it as a submodule. A repo
-that is nobody's submodule is a workspace by itself; a cwd outside any git
+that is not a submodule of another repo is a workspace by itself; a cwd outside any git
 repo is an error.
 
 Actions only run when safe: pins advance only to pushed revs (and, by
 default, only if the proposed pin state passes an evaluation-only nix flake
-check), and a pin that cannot advance holds back only itself, never its
+check), and a pin that cannot advance holds back only itself, not its
 siblings. Pushes are skipped on detached HEADs or when behind upstream, and
 repos with uncommitted changes (other than flake.lock and submodule
 pointers) block automation in that repo. Blockers are reported for you to
@@ -269,7 +269,7 @@ run() {
 # The workspace root comes from the caller's cwd, not from the location of
 # this script: find the enclosing git repo, then walk up as long as the
 # current repo is registered as a submodule of an enclosing one, ending at
-# the parent-most superproject. A repo that is nobody's submodule is a
+# the parent-most superproject. A repo that is not a submodule of another repo is a
 # root by itself; a cwd outside any git repo is an error.
 find_root() {
   local top super

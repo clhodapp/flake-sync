@@ -22,10 +22,10 @@ depend on it can pin it; finally the workspace's submodule pointers are
 committed as `maint: bump ...` and pushed. A pin that fails the check is
 held back alone, and the rest still advance.
 
-Two modes:
+`converge` runs with or without `--local`:
 
 - **`converge --local`** writes the new locks into the working trees and
-  stops: no commits, no pushes. Exit 0 means every pin can advance, which
+  stops, without committing or pushing. Exit 0 means the stale pins can advance, which
   is the check that a real converge will succeed. It runs anywhere,
   including linked worktrees and dirty trees.
 - **`converge`** commits and pushes. Outside CI, a repo's pin commits go
@@ -39,13 +39,12 @@ Two modes:
 Scope flags widen what counts as a pin: `--with-partitions` adds tracked
 `flake.lock` files below each repo root, `--with-external` adds inputs
 that are not workspace repos (nixpkgs, for one), and `--all` adds both
-plus `--with-tests`. External pins change what everything builds
+plus `--with-tests`. External pins change what the workspace builds
 against, so the workspace's instructions usually reserve them.
 
 ## Reading blockers
 
-`converge` exits 1 with a list of blockers; that is a report, not a
-crash. `status` and `next` show the same list before anything runs.
+`converge` exits 1 with a list of blockers when it cannot finish. `status` and `next` show the same list before anything runs.
 
 | Blocker | Cause | Resolution |
 |---|---|---|
@@ -53,7 +52,7 @@ crash. `status` and `next` show the same list before anything runs.
 | `holding X (fails nix flake check)`, `held back: fail nix flake check` | The consumer does not evaluate (or build) against X's new head. | Fix the consumer or X; the check output above the message names the error. |
 | `stale pins (...) but repo has N uncommitted change(s)` | Pins cannot be committed over unrelated work. | Commit or discard that work. |
 | `uncommitted changes in flake.lock that are not pin updates` | A lock differs from `HEAD` in ways flake-sync does not make, such as a hand-run `nix flake update`. | Commit or discard the lock change. |
-| `HEAD is detached; check out a branch` | Commits there would belong to no branch. | Check out the default branch (`flake-sync pull` does it for every submodule). |
+| `HEAD is detached; check out a branch` | Commits there would belong to no branch. | Check out the default branch (`flake-sync pull` does that for each submodule). |
 | `behind upstream by N; run 'flake-sync pull'` | The remote moved. | `flake-sync pull`, or `flake-sync rebase <repo>` for a topic branch. |
 | `stale pins (...) but not checked out here` | The repo is absent from this checkout, and the pins in its lock need moving. | `--checkout-missing`, or `flake-sync checkout <repo>`, then rerun. |
 | `commits on <branch> that are not flake-sync pin updates` | The default branch holds other work, which an immediate merge would publish unreviewed. | Move that work to a topic branch and publish it as a pull request. |
@@ -62,7 +61,7 @@ crash. `status` and `next` show the same list before anything runs.
 
 ## Related commands
 
-- `flake-sync check` runs `nix flake check` over every repo against its
+- `flake-sync check` runs `nix flake check` over the repos against their
   current locks, without moving anything: where the workspace stands.
 - `flake-sync step` runs one ready action; `step <action> <repo>` runs
   one specific action (`update-pins`, `push`, `bump-submodules`).

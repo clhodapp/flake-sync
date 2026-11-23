@@ -36,7 +36,7 @@ requests and to merge them. Each repo gets a state:
 
 | State | Meaning | Next |
 |---|---|---|
-| `ready` | Its default branch pins every workspace dependency at that dependency's remote head. | Open or update the pull request; it can be reviewed once the branch contains the default branch. |
+| `ready` | Its default branch pins each workspace dependency at its remote head. | Open or update the pull request; it can be reviewed once the branch contains the default branch. |
 | `dependencies not ready` | A repo it depends on is also listed: that change is not merged. | Open it as a draft, or wait; work on the dependency's pull request first. |
 | `waiting for convergence` | The dependency merged, but the default branch of this repo does not pin the merged commit yet. | Wait for convergence (or run it, if the workspace's instructions allow), then rerun `--fetch unmerged-commits`. |
 

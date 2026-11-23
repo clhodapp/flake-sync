@@ -652,14 +652,14 @@ expect_contains "$out" "machines" "a submodule cwd resolves to the enclosing wor
 git -C "$scratch/projects/lib" submodule -q add "file://$HUB/extdep.git" vendor/extdep
 out=$(cd "$scratch/projects/lib/vendor/extdep" && "$FS" status)
 expect_contains "$out" "machines" "a nested submodule cwd resolves to the parent-most workspace"
-# A repo that is nobody's submodule is a root by itself (here a repo without
+# A repo that is not a submodule of another repo is a root by itself (here a repo without
 # submodules, so the .gitmodules requirement names that repo itself).
 plain=$(mktemp -d)/plain
 git clone -q "file://$HUB/lib.git" "$plain"
 plain_root=$(git -C "$plain" rev-parse --show-toplevel)
 rc=0; out=$(cd "$plain" && "$FS" status 2>&1) || rc=$?
 [ "$rc" -ne 0 ] || fail "a repo without submodules should be rejected as a root"
-expect_contains "$out" "$plain_root has no .gitmodules" "a repo that is nobody's submodule is a root by itself"
+expect_contains "$out" "$plain_root has no .gitmodules" "a repo that is not a submodule of another repo is a root by itself"
 # Outside any git repo, flake-sync fails with a clear message. The
 # ceiling keeps git from walking above the scratch dir, so the scenario
 # holds even when TMPDIR itself sits inside some checkout.

@@ -3,9 +3,9 @@
 Assesses and converges a *workspace* of flake repos in dependency (DAG)
 order: a git repo whose submodules are flakes that pin each other via
 `flake.lock` inputs, while the workspace tracks each of them as a
-submodule. Convergence means every repo's pins point at the sibling's
-current HEAD, every repo is pushed, and the workspace's submodule
-pointers match submodule HEADs. Repos and cross-repo pins are discovered
+submodule. The workspace is converged when the repos pin each other at
+their current heads, they are pushed, and the workspace's submodule
+pointers match the submodule heads. Repos and cross-repo pins are discovered
 from `.gitmodules` and the lock files; nothing is hardcoded.
 
 The problem it solves: once a set of flakes pins each other by revision,
@@ -17,10 +17,10 @@ that no longer build. flake-sync works out the order from the repos
 themselves and runs it.
 
 ```sh
-flake-sync status            # git and pin state of every repo, pending actions
+flake-sync status            # git and pin state of the repos, pending actions
 flake-sync converge          # run ready actions until converged or blocked
 flake-sync converge --local  # advance working-tree locks only; publish nothing
-flake-sync check             # read-only nix flake check sweep over every repo
+flake-sync check             # nix flake check over the repos, read-only
 flake-sync pull              # down-sync a checkout the remotes moved past
 flake-sync pull --heads      # ...to the remotes' tips, ahead of the recorded pointers
 flake-sync graph             # the dependency DAG in topological order
@@ -71,16 +71,16 @@ contributors say when to use them, and `flake-sync-new-workspace` walks
 through settling those instructions with the workspace's owner.
 
 `nix profile install github:clhodapp/flake-sync` puts it on `PATH`
-permanently. The package carries every program it runs, `git`, `nix`
+permanently. The package carries the programs it runs, `git`, `nix`
 and `gh` included.
 
 The workspace is found from the current directory: the enclosing git
 repo, walked up to the parent-most repo that tracks it as a submodule. A
-repo that is nobody's submodule is a workspace by itself; running outside
+repo that is not a submodule of another repo is a workspace by itself; running outside
 any git repo is an error.
 
 Pins only advance to pushed revs (which is what forces the DAG
-ordering), and every proposed pin state is validated with an
+ordering), and a proposed pin state is first validated with an
 evaluation-only `nix flake check` before a lock is written. A pin that
 cannot advance holds back only itself. `converge --local` advances
 working-tree locks through the same gate and publishes nothing, as a

@@ -13,7 +13,7 @@ file is the full flake-sync reference.
 ## How the workspace fits together
 
 A flake-sync workspace is a git repo whose submodules are flake repos.
-Two kinds of reference tie them together, and keeping both current is
+Pins and pointers tie them together, and keeping them current is
 called convergence:
 
 - **Pins.** Each repo's `flake.lock` locks its sibling repos at exact
@@ -30,10 +30,10 @@ dependency, re-pin and push each consumer, and bump the workspace
 pointers last. Consumers of consumers follow the same way, down the
 dependency graph (`flake-sync graph` prints it).
 
-A change in one repo therefore moves through three stages before every
-consumer uses it: on a branch, on the repo's default branch, and pinned
-by each consumer's default branch. The pull-request and convergence
-skills cover the last two.
+A change in one repo therefore reaches its consumers only once it is
+on the repo's default branch and each consumer's default branch pins
+it. The pull-request skill covers getting it onto the default branch;
+the convergence skill covers the pinning.
 
 ## Orienting
 
@@ -60,7 +60,7 @@ branch, started from the remote default branch. A plain `git submodule
 update --init` in a worktree instead clones a separate copy and leaves
 it on a detached HEAD, where commits are easy to strand.
 
-In the primary checkout, `flake-sync pull` brings everything to the
+In the primary checkout, `flake-sync pull` brings the checkout to the
 published state: it fast-forwards the workspace and puts each submodule
 on its default branch at the recorded pointer. `pull --heads` goes to
 the remote tips, which are ahead of the pointers until convergence
