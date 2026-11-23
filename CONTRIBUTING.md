@@ -1,62 +1,57 @@
 # Contributing
 
-## The shape of the thing
+## Layout
 
-The tool is one bash script,
-`src/flake-sync`, using `jq` for JSON. It is
-packaged with `writeShellApplication`, which shellchecks it as part of
-the build and pins its runtime dependencies, so the package cannot
-build if the script has a shellcheck error or calls a program that is
-not declared in `runtimeInputs`.
+- `src/flake-sync`: the tool, a bash script that uses `jq` for JSON.
+- `skills/`: agent skills for using flake-sync in a workspace, one
+  directory each.
+- `pkg-overlays/`: the packages, `flake-sync` (built with
+  `writeShellApplication`, which shellchecks the script) and
+  `flake-sync-skills`.
+- `configs/flake-parts/`: the flake outputs.
+- `tests/vm/`: the lifecycle test.
 
-`skills/` holds the agent skills for using flake-sync in a workspace, one
-directory each, packaged as `flake-sync-skills`. Everything else in the
-repo is scaffolding: `pkg-overlays/` packages the script and the skills,
-`configs/flake-parts/` wires the flake outputs, and `tests/vm/` is the
-lifecycle test.
+## Rules
 
-## Working on it
+- Declare every program the script runs in `runtimeInputs` of
+  `pkg-overlays/default/packages/flake-sync/default.nix`.
+- Add a scenario to `tests/vm/scenarios.sh` for each change in behavior.
+- Update the reference (`docs/development/flake-sync.md`), the README,
+  and the help text in `src/flake-sync` along with the behavior.
+- Keep the skills to what the commands do. Leave when to use them to
+  the workspace's instructions; put no workspace policy in them.
+- Advance pins only to pushed revisions. Lock an unpushed revision and
+  nobody else can resolve the lock.
+- Hold back only the pin that cannot advance. Let the other pins of the
+  repo advance and be committed, and report what was held.
+- `git add` new files before running a check; the flake reads the git
+  tree, so an untracked file is invisible to the build.
+- Write commit messages with a `type: summary` first line (`feat`, `fix`,
+  `maint`, `docs`, `refactor`), in the present tense, with a body saying
+  why when the change is not self-evident. Rebase; do not merge.
+- Run `nix flake check` before opening a pull request.
 
-While editing, `bash -n src/flake-sync` is the
-quick syntax pass. Then:
+## Checks
 
 ```sh
-nix flake check
+bash -n src/flake-sync                                  # syntax, while editing
+nix build '.#checks.x86_64-linux.flake-sync-package'    # build + shellcheck
+nix build '.#checks.x86_64-linux.treefmt'               # formatting
+nix build '.#checks.x86_64-linux.vm-lifecycle' -L       # the lifecycle test
+nix fmt                                                 # format the Nix files
 ```
 
-That builds the package (shellcheck included), checks formatting, and
-runs the VM lifecycle test. The VM test takes a while; to iterate faster,
-build the pieces separately:
-
-```sh
-nix build '.#checks.x86_64-linux.flake-sync-package' # build + shellcheck
-nix build '.#checks.x86_64-linux.treefmt'            # formatting
-nix build '.#checks.x86_64-linux.vm-lifecycle'       # the lifecycle test
-```
-
-`nix fmt` formats the Nix files.
-
-A change in behavior comes with a scenario in `tests/vm/scenarios.sh`,
-and with updates to the reference (`docs/development/flake-sync.md`),
-the README, and the help text in `src/flake-sync`. The skills in
-`skills/` describe what the commands do; when to use them is the
-business of a workspace's instructions, so the skills hold no
-workspace policy.
-
-If you add a file, `git add` it before running a check. Nix evaluates the
-flake from the git tree, so an untracked file is invisible and the build
-will fail confusingly.
+`nix flake check` runs all three checks.
 
 ## The lifecycle test
 
-`tests/vm/` builds a "fake GitHub": a set of local bare repos wired
-together as a workspace with cross-repo flake pins, all inside a NixOS
-VM with no network. The test then drives the *packaged* executable
-through the scenarios in `tests/vm/scenarios.sh`, so it exercises what
-users actually run rather than the script in the working tree.
+`tests/vm/fixture.sh` builds a workspace of local bare repos with
+cross-repo flake pins, using `git+file://` remotes, inside a NixOS VM
+with no network. `tests/vm/scenarios.sh` then drives the packaged
+executable through plain bash assertions on its output and on the
+resulting repo state.
 
-To run the scenarios on the host instead of in the VM, which is faster
-while developing a scenario:
+To run the scenarios on the host, faster while writing one:
 
 ```sh
 T=$(mktemp -d)
@@ -64,32 +59,3 @@ HUB=$T/hub WORK=$T/workspace bash tests/vm/fixture.sh
 HUB=$T/hub WORK=$T/workspace FLAKE_SYNC=$PWD/src/flake-sync \
   bash tests/vm/scenarios.sh
 ```
-
-The fixture uses `git+file://` remotes rather than `github:` ones, which
-works because the tool advances pins for non-GitHub submodule remotes
-with `git+file://…?rev=…&ref=…` overrides.
-
-New behavior wants a scenario. The scenarios are plain bash assertions
-against the tool's output and the resulting repo state, so adding one
-means adding a case to `scenarios.sh` rather than learning a framework.
-
-## Two invariants worth knowing before you change behavior
-
-**Pins only ever advance to pushed revisions.** This is what forces the
-dependency ordering, and it is why a pin whose target is unpushed is
-held rather than written. Writing an unpushed revision into a lock
-produces a lock nobody else can resolve.
-
-**A pin that cannot advance holds back only itself.** Failures are
-per-pin, not per-run: the rest of that repo's pins still advance and get
-committed, and the action reports what it held. Preserve that when
-touching the update path, or one bad dependency will stall everything
-downstream of it.
-
-## Commits and pull requests
-
-Commit messages use a `type: summary` first line (`feat`, `fix`,
-`maint`, `docs`), present tense, with a body explaining why when the
-change is not self-evident. History is linear; rebase rather than merge.
-
-Please make sure `nix flake check` passes before opening a pull request.
