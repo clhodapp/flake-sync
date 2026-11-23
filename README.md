@@ -27,14 +27,16 @@ flake-sync graph             # the dependency DAG in topological order
 flake-sync checkout <repo>   # add a submodule to a checkout that holds only some
 flake-sync override-inputs <ref>  # a flake ref plus overrides to the remote heads
 flake-sync unmerged-commits  # changes not on the default branches, in pull request order
-flake-sync pr <repo> …       # open or update a pull request, a draft until it can merge
+flake-sync pr <repo> …       # open or update a pull request for a topic branch
 flake-sync rebase <repo>     # rebase a topic branch onto the converged default branch
 ```
 
 A change in one repo that another repo needs goes through pull requests
 in dependency order: `unmerged-commits` gives the order and says which
-pull requests can leave draft, and `pr` keeps a pull request a draft
-until its default branch pins the merged dependencies. Lock changes are
+pull requests can leave draft. `pr` opens a pull request as a draft while
+a change it needs is unmerged, or merged but not yet pinned by the
+repo's default branch, and takes it out of draft once both have
+happened. Lock changes are
 not part of those pull requests; convergence makes them on the default
 branches. A converge run outside CI merges them through separate pull
 requests that hold only lock changes and are merged at once; CI
