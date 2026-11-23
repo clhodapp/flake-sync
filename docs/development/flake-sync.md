@@ -315,7 +315,7 @@ only when that tip is part of the local branch's history.
 For a change A in repo 1 that change B in repo 2 needs:
 
 1. Develop both on topic branches; build B against A with
-   `nix build $(flake-sync override-inputs --local ./projects/repo-2#…)`.
+   `nix build $(flake-sync --local override-inputs ./<path-to-repo-2>#<attr>)`.
 2. `pr repo-1 …` opens A for review; `pr repo-2 …` opens B as a draft
    (dependencies not ready).
 3. A merges; convergence re-pins repo 2's default branch (B shows
@@ -385,7 +385,7 @@ landing changes that didn't go through the gate.
 
 ```sh
 nixos-rebuild switch --sudo --flake $(flake-sync override-inputs .)
-home-manager switch --flake $(flake-sync override-inputs '.#chris@chris-desktop-2')
+home-manager switch --flake $(flake-sync override-inputs '.#<user>@<host>')
 nix build $(flake-sync override-inputs '.#pkg')
 ```
 
@@ -408,7 +408,7 @@ substitution does not capture. An input whose repo has no initialized
 submodule here moves to the head of the repo's remote.
 
 ```sh
-nixos-rebuild build --flake $(flake-sync --local override-inputs ./projects/ch-personal-machines)
+nixos-rebuild build --flake $(flake-sync --local override-inputs ./<path-to-a-submodule>)
 ```
 
 The walk covers inputs at any depth that are not `follows`, so a repo that
@@ -432,11 +432,11 @@ When `override-inputs` fails, the shell substitutes nothing and still runs
 the command, so `--flake $(flake-sync override-inputs <ref>)` becomes a
 bare `--flake`. `nixos-rebuild` then evaluates the flake of the current
 directory. Its error names that flake, as in `flake
-'git+file:///home/chris/Projects/ch-nix-workspace' does not provide
-attribute 'nixosConfigurations."chris-desktop-2"'`. To stop on a failure,
-run the substitution first, as in
-`args=$(flake-sync override-inputs <ref>) && nixos-rebuild switch --flake ${=args}`
-in zsh.
+'git+file:///path/to/workspace' does not provide attribute
+'nixosConfigurations."<host>"'`. To stop on a failure, run the
+substitution first and split its result into words when using it: in
+bash, `args=$(flake-sync override-inputs <ref>) && nixos-rebuild switch --flake $args`;
+zsh does not split an unquoted variable, so there it is `${=args}`.
 
 ## Run the newest flake-sync: --latest-flake-sync
 
