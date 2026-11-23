@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: MIT
 #
 # Agent skills for working in a flake-sync workspace, one directory per
-# skill with a SKILL.md, the format Claude Code, Codex and OpenCode read.
+# skill with a SKILL.md, in the Agent Skills format.
 # Each skill carries the flake-sync reference as reference.md, the file
 # its SKILL.md points into, so the reference has one source:
 # docs/development/flake-sync.md. In the repo, reference.md is a relative

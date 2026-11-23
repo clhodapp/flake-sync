@@ -5,7 +5,7 @@ description: Understand and work in a git workspace whose submodules are flakes 
 
 # Working in a flake-sync workspace
 
-The workspace's instructions (its CLAUDE.md or contributing docs) say
+The workspace's instructions for agents and contributors say
 when to push, land, and converge. This skill explains how the workspace
 fits together, so the commands make sense. `reference.md` beside this
 file is the full flake-sync reference.
