@@ -59,8 +59,9 @@ Commands:
   converge    Run ready actions until converged or blocked (with --local:
               working trees only: advance locks, commit and push nothing)
   pull        Down-sync from the remotes: fetch, fast-forward the workspace
-              to its upstream, init missing submodules, then re-attach every
-              submodule to its default branch fast-forwarded to the recorded
+              to its upstream, clone registered submodules that are not
+              cloned (unregistered ones stay out), then re-attach every
+              checked-out submodule to its default branch fast-forwarded to the recorded
               pointer, leaving no detached HEADs behind. A submodule that is
               dirty, diverged, or parked on a topic branch is held (and
               reported) rather than touched; exit 1 if anything held.
@@ -1221,19 +1222,34 @@ cmd_pull() {
   if [ "${AHEAD[$WS]}" -gt 0 ]; then
     echo "${C_YLW}note: workspace has ${AHEAD[$WS]} unpushed commit(s); recorded pointers may be ahead of the remotes${C_OFF}"
   fi
-  local key path missing=()
+  # A checkout may hold only some submodules. One registered in the
+  # workspace's .git/config (`git submodule init`) but not cloned is
+  # wanted and gets cloned; an unregistered one stays out.
+  local key path missing=() PULL_ABSENT=()
   while read -r key path; do
-    [ -e "$ROOT/$path/.git" ] || missing+=("$path")
+    [ ! -e "$ROOT/$path/.git" ] || continue
+    if git -C "$ROOT" config --get "${key%.path}.url" >/dev/null; then
+      missing+=("$path")
+    else
+      PULL_ABSENT+=("$path")
+    fi
   done < <(git config -f "$ROOT/.gitmodules" --get-regexp '^submodule\..*\.path$')
   if [ ${#missing[@]} -gt 0 ]; then
     run git -C "$ROOT" submodule update --init -- "${missing[@]}" \
       || echo "${C_YLW}warning: submodule init failed; the failed one(s) will be held${C_OFF}"
   fi
   local PULL_SYNCED=0 PULL_HELD=() PULL_NOTES=() # written by pull_sub (dynamic scoping)
+  local absent
   while read -r key path; do
+    for absent in ${PULL_ABSENT[@]+"${PULL_ABSENT[@]}"}; do
+      [ "$absent" != "$path" ] || continue 2
+    done
     pull_sub "$path" "$ptr_ref"
   done < <(git config -f "$ROOT/.gitmodules" --get-regexp '^submodule\..*\.path$')
   echo
+  if [ ${#PULL_ABSENT[@]} -gt 0 ]; then
+    echo "not checked out here, left alone: ${PULL_ABSENT[*]} (git submodule update --init <path> adds one)"
+  fi
   local n
   for n in ${PULL_NOTES[@]+"${PULL_NOTES[@]}"}; do echo "${C_YLW}note: $n${C_OFF}"; done
   local at="the recorded pointer"

@@ -548,13 +548,14 @@ git -C projects/lib commit -aqm "feat: lib change for the pull scenario"
 $FS converge >/dev/null
 # Rewind to the classic stale checkout: workspace behind its upstream,
 # submodule mains old, HEADs detached at the old pointers, one submodule
-# not even initialized.
+# registered (git submodule init) but not cloned.
 git reset -q --hard "$old_ws"
 git -C projects/lib reset -q --hard "$old_lib"
 git -C projects/app reset -q --hard "$old_app"
 git -C projects/machines reset -q --hard "$old_machines"
 git submodule -q update
 git submodule -q deinit -f projects/machines >/dev/null
+git submodule -q init projects/machines
 out=$($FS status 2>&1)
 expect_contains "$out" "flake-sync pull" "blocked plan points at the pull verb"
 out=$($FS pull)
@@ -710,5 +711,20 @@ out=$($FS --fetch status 2>&1 || true)
 git -C projects/machines remote set-url origin "file://$HUB/machines.git"
 expect_contains "$out" "fetch failed for machines" "a failed fetch is still reported"
 git -C projects/app checkout -q main
+
+echo "=== 21. pull works in a checkout that holds only some submodules"
+git -C projects/lib reset -q --hard origin/main
+git submodule deinit -q -f projects/machines
+[ ! -e projects/machines/.git ] || fail "test setup: machines should be out of the checkout"
+rc=0; out=$($FS pull 2>&1) || rc=$?
+[ "$rc" -eq 0 ] || { printf 'output was:\n%s\n' "$out" >&2; fail "pull should succeed without the unregistered machines"; }
+[ ! -e projects/machines/.git ] || fail "pull must not check out an unregistered submodule"
+expect_contains "$out" "not checked out here, left alone: projects/machines" "pull names the submodule it left out"
+[ "$(git -C projects/app symbolic-ref --short HEAD)" = main ] || fail "pull still syncs the submodules that are checked out"
+echo "ok: pull leaves out an unregistered submodule and syncs the rest"
+git submodule init -q projects/machines
+$FS pull >/dev/null
+[ -e projects/machines/.git ] || fail "pull should clone a submodule registered with git submodule init"
+echo "ok: pull clones a submodule that is registered but not cloned"
 
 echo "ALL SCENARIOS PASSED"

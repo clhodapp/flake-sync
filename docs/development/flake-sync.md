@@ -136,8 +136,13 @@ pointer is the pushed tip of its submodule's default branch, so `pull` can
 re-attach each submodule to that branch, fast-forwarded to the pointer.
 
 Concretely: fetch everything, fast-forward the workspace to its upstream,
-`git submodule update --init` anything uninitialized, then per submodule
-check out the default branch and fast-forward it to the recorded pointer.
+clone each submodule that is registered (`git submodule init`) but not
+cloned, then per submodule check out the default branch and fast-forward
+it to the recorded pointer. A checkout may hold only some submodules: one
+that is not registered in the workspace's `.git/config`, such as after
+`git submodule deinit`, is left out, not counted as held, and named in a
+closing note. A submodule newly added to `.gitmodules` is not registered
+yet either, so it too stays out until `git submodule update --init <path>`.
 Everything moves by fast-forward only, and the hold-backs mirror
 `converge`'s per-repo style: a submodule that is dirty (when files would
 have to move), whose default branch has diverged from the pointer, or
