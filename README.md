@@ -59,11 +59,8 @@ Or add it to the workspace's dev shell:
 }
 ```
 
-The workspace's `flake.lock` then decides the version everyone in the
-workspace runs, and updating the input moves it forward, with
-`nix flake update flake-sync` or whatever routine updates the
-workspace's other inputs. `flake-sync --latest-flake-sync <command>`
-runs the head of `main` without changing the lock.
+`flake-sync --latest-flake-sync <command>` runs the head of `main`
+instead of the pinned version.
 
 The `flake-sync-skills` package holds agent skills for setting up and
 working in a flake-sync workspace (`flake-sync-new-workspace`,
@@ -133,10 +130,7 @@ them.
 
 ## Stability
 
-flake-sync is a rolling release: the head of `main` is the current
-version, and updating a workspace's flake-sync input moves it to that
-head. Commands and flags can change between versions; `flake-sync
---help` and the reference describe the version in use.
+flake-sync is a rolling release; commands and flags can change.
 
 ## License
 
