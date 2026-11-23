@@ -40,7 +40,8 @@ the workspace situation it is for.
 
 ## Pull requests
 
-- Fork the repo and branch from `main`; keep a pull request to one change.
+- Branch from `main`, in a fork if you cannot push to the repo; keep a
+  pull request to one change.
 - Run `nix flake check` before opening it. CI runs it again on the pull
   request.
 - In the description, say what changes and why, and name the scenario
