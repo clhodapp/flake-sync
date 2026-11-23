@@ -813,7 +813,7 @@ expect_contains "$out" "commit app: uncommitted changes in flake.lock that are n
 git -C projects/app checkout -q -- flake.lock
 assert_converged "discarding the change converges again"
 
-echo "=== 24. in a linked worktree of the workspace, checkout shares the module repos and converge pushes topic branches"
+echo "=== 24. in a linked worktree of the workspace, checkout shares the module repos and pins move only by explicit steps"
 wt=$(mktemp -d)/wt
 git worktree add -q -b agent-topic "$wt"
 modules=$(git rev-parse --path-format=absolute --git-common-dir)/modules
@@ -831,18 +831,28 @@ echo topic >"$wt/projects/lib/topic.txt"
 git -C "$wt/projects/lib" add topic.txt
 git -C "$wt/projects/lib" commit -qm "feat: lib change on a topic branch"
 rc=0; out=$(cd "$wt" && "$FS" --fetch converge 2>&1) || rc=$?
-[ "$rc" -ne 0 ] || fail "converge should stop on machines, which the worktree does not hold"
-expect_contains "$out" "update-pins machines: stale pins (app,lib) but not checked out here" "the absent machines blocks"
-[ "$(git --git-dir="$HUB/lib.git" rev-parse agent-topic)" = "$(head_rev "$wt/projects/lib")" ] || fail "converge should push lib's topic branch"
-[ "$(git --git-dir="$HUB/lib.git" rev-parse main)" != "$(head_rev "$wt/projects/lib")" ] || fail "converge must not push lib's main"
-[ "$(lock_rev "$wt/projects/app" lib)" = "$(head_rev "$wt/projects/lib")" ] || fail "app should pin lib's topic head"
-[ "$(git --git-dir="$HUB/app.git" rev-parse agent-topic)" = "$(head_rev "$wt/projects/app")" ] || fail "converge should push app's topic branch"
-echo "ok: converge in a linked worktree pushes topic branches and re-pins onto them"
-out=$(cd "$wt" && "$FS" --fetch --checkout-missing converge 2>&1) || { printf 'output was:\n%s\n' "$out" >&2; fail "converge --checkout-missing in a linked worktree"; }
-[ "$(git -C "$wt/projects/machines" symbolic-ref --short HEAD)" = agent-topic ] || fail "machines should be checked out on the topic branch"
-[ "$(git --git-dir="$HUB/workspace.git" rev-parse agent-topic)" = "$(head_rev "$wt")" ] || fail "the workspace topic branch should be pushed"
-[ "$(git --git-dir="$HUB/workspace.git" rev-parse main)" != "$(head_rev "$wt")" ] || fail "the workspace main must not move"
-echo "ok: --checkout-missing in a linked worktree checks out from the shared repo and the whole topic converges"
+[ "$rc" -ne 0 ] || fail "a publishing converge should refuse in a linked worktree"
+expect_contains "$out" "converge publishes from the primary checkout" "converge in a linked worktree points at the primary checkout"
+rc=0; out=$(cd "$wt" && "$FS" step 2>&1) || rc=$?
+[ "$rc" -ne 0 ] || fail "step with no action should refuse in a linked worktree"
+git --git-dir="$HUB/lib.git" rev-parse -q --verify agent-topic >/dev/null && fail "nothing should be pushed by the refused commands"
+echo "ok: a linked worktree refuses converge and step with no action"
+rc=0; out=$(cd "$wt" && "$FS" step update-pins app 2>&1) || rc=$?
+[ "$rc" -ne 0 ] || fail "update-pins should refuse in a linked worktree"
+expect_contains "$out" "topic branches carry no pin moves" "update-pins in a linked worktree names the rule"
+echo app-topic >"$wt/projects/app/topic.txt"
+git -C "$wt/projects/app" add topic.txt
+git -C "$wt/projects/app" commit -qm "feat: app change that needs the lib change"
+rc=0; out=$(cd "$wt" && "$FS" --fetch step push app 2>&1) || rc=$?
+[ "$rc" -ne 0 ] || fail "app should not be pushed while lib has unpushed commits"
+expect_contains "$out" "app depends on lib, which has unpushed commits" "the refusal names the dependency"
+(cd "$wt" && "$FS" --fetch step push lib) >/dev/null 2>&1 || fail "step push lib should push lib's topic branch"
+[ "$(git --git-dir="$HUB/lib.git" rev-parse agent-topic)" = "$(head_rev "$wt/projects/lib")" ] || fail "lib's topic branch should be on the hub"
+[ "$(git --git-dir="$HUB/lib.git" rev-parse main)" != "$(head_rev "$wt/projects/lib")" ] || fail "lib's main must not move"
+(cd "$wt" && "$FS" --fetch step push app) >/dev/null 2>&1 || fail "app should push once lib is pushed"
+[ "$(git --git-dir="$HUB/app.git" rev-parse agent-topic)" = "$(head_rev "$wt/projects/app")" ] || fail "app's topic branch should be on the hub"
+git -C "$wt/projects/app" diff --quiet "$(hub_rev app)" -- flake.lock || fail "app's topic branch must carry no lock move"
+echo "ok: topic branches push in dependency order and carry no pin moves"
 git worktree remove --force "$wt"
 for s in lib app machines; do git -C "$modules/projects/$s" worktree prune; done
 

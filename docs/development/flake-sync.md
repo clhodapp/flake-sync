@@ -217,10 +217,15 @@ worktree serves all of them. It fetches that repo, cloning it there first
 if no checkout has needed it before, and adds the submodule as a linked
 worktree of it. The checkout is on a branch named after the workspace
 worktree's branch, created from `origin`'s default branch tip with no
-upstream, so `converge` in the worktree pushes it as a topic branch of
-the same name. There `converge` commits pin updates on those branches,
-pushes them, and re-pins consumers onto the pushed topic heads; the
-remote default branches do not move.
+upstream, so a push sends it to a topic branch of the same name.
+
+Topic branches carry no pin moves; locks move only by convergence on the
+default branches. In a linked worktree, a publishing `converge`,
+`step update-pins`, and `step` with no explicit action refuse. To build
+against local, unpushed changes of other repos, use
+`override-inputs --local`. `step push <repo>` pushes a topic branch, and
+refuses while a repo it depends on has commits that are not pushed yet,
+so branches reach the remote in dependency order.
 
 ## Local convergence: check and accelerate, publish nothing
 

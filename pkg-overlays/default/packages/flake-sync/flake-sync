@@ -987,6 +987,15 @@ do_push() {
   ! $LOCAL || die "push is publication; --local touches working trees only"
   [ "${BRANCH[$repo]}" != "(detached)" ] || die "$repo is on a detached HEAD"
   [ "${BEHIND[$repo]}" = 0 ] || die "$repo is behind upstream; pull/rebase first"
+  if $LINKED; then
+    # A topic branch goes to GitHub only once what it builds against is
+    # there: no repo it depends on may hold unpushed commits.
+    local dep waiting=()
+    for dep in ${DEPS[$repo]:-}; do
+      [ -n "${DIR[$dep]:-}" ] && [ "${AHEAD[$dep]}" -gt 0 ] && waiting+=("$dep")
+    done
+    [ ${#waiting[@]} -eq 0 ] || die "$repo depends on ${waiting[*]}, which has unpushed commits; push it first (step push <repo>)"
+  fi
   local args=()
   [ "${HAS_UPSTREAM[$repo]}" = yes ] || args=(-u origin "${BRANCH[$repo]}")
   if ! run git -C "$dir" push --quiet "${args[@]}"; then
@@ -1686,6 +1695,20 @@ fi
 if [ "$CMD" = override-inputs ]; then
   cmd_override_inputs "${ARGS[@]}"
   exit 0
+fi
+
+# A linked worktree of the workspace holds topic branches, which carry no
+# pin moves: locks move only by convergence on the default branches,
+# after merges. A topic branch is pushed only once every repo it depends
+# on has its commits pushed.
+LINKED=false
+[ "$(git -C "$ROOT" rev-parse --path-format=absolute --git-dir)" = "$(git -C "$ROOT" rev-parse --path-format=absolute --git-common-dir)" ] || LINKED=true
+if $LINKED && ! $LOCAL; then
+  case $CMD in
+    converge) die "converge publishes from the primary checkout, onto the default branches; in a linked worktree use converge --local, or override-inputs --local to build against local changes" ;;
+    step) [ "${ARGS[0]:-}" = push ] && [ ${#ARGS[@]} -eq 2 ] \
+      || die "in a linked worktree, step runs only 'step push <repo>': topic branches carry no pin moves" ;;
+  esac
 fi
 
 load_state
