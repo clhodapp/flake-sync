@@ -4,7 +4,8 @@
 # skill with a SKILL.md, the format Claude Code, Codex and OpenCode read.
 # Each skill carries the flake-sync reference as reference.md, the file
 # its SKILL.md points into, so the reference has one source:
-# docs/development/flake-sync.md.
+# docs/development/flake-sync.md. In the repo, reference.md is a relative
+# symlink to that doc; the package copies the doc itself.
 { lib, runCommand }:
 let
   skills = [
