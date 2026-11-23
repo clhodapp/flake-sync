@@ -532,7 +532,7 @@ the repo root:
 ```sh
 T=$(mktemp -d)
 HUB=$T/hub WORK=$T/workspace bash tests/vm/fixture.sh
-HUB=$T/hub WORK=$T/workspace FLAKE_SYNC=$PWD/pkg-overlays/default/packages/flake-sync/flake-sync \
+HUB=$T/hub WORK=$T/workspace FLAKE_SYNC=$PWD/src/flake-sync \
   bash tests/vm/scenarios.sh
 ```
 
@@ -548,5 +548,5 @@ addition to `github:` ones; pins for non-github submodule remotes are
 advanced with `git+file://…?rev=…&ref=…` overrides.
 
 Building the package itself (`nix build`, or the `package` check) also
-shellchecks the script; `bash -n pkg-overlays/default/packages/flake-sync/flake-sync`
+shellchecks the script; `bash -n src/flake-sync`
 is the quick syntax pass while editing.

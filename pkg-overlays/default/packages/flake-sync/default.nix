@@ -35,7 +35,7 @@ writeShellApplication {
   # writeShellApplication supplies a shebang (and shellchecks the
   # result at build time); the file keeps one so it also runs directly
   # from a checkout during development.
-  text = lib.removePrefix "#!/usr/bin/env bash\n" (builtins.readFile ./flake-sync);
+  text = lib.removePrefix "#!/usr/bin/env bash\n" (builtins.readFile ../../../../src/flake-sync);
 
   meta = {
     description = "Assess and converge a workspace's flake repos in DAG order";

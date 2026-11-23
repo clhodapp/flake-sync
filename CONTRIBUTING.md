@@ -3,19 +3,21 @@
 ## The shape of the thing
 
 The tool is one bash script,
-`pkg-overlays/default/packages/flake-sync/flake-sync`, using `jq` for JSON. It is
+`src/flake-sync`, using `jq` for JSON. It is
 packaged with `writeShellApplication`, which shellchecks it as part of
 the build and pins its runtime dependencies, so the package cannot
 build if the script has a shellcheck error or calls a program that is
 not declared in `runtimeInputs`.
 
-Everything else in the repo is scaffolding: `pkg-overlays/` packages the script,
+`skills/` holds the agent skills for using flake-sync in a workspace, one
+directory each, packaged as `flake-sync-skills`. Everything else in the
+repo is scaffolding: `pkg-overlays/` packages the script and the skills,
 `configs/flake-parts/` wires the flake outputs, and `tests/vm/` is the
 lifecycle test.
 
 ## Working on it
 
-While editing, `bash -n pkg-overlays/default/packages/flake-sync/flake-sync` is the
+While editing, `bash -n src/flake-sync` is the
 quick syntax pass. Then:
 
 ```sh
@@ -33,6 +35,13 @@ nix build '.#checks.x86_64-linux.vm-lifecycle'       # the lifecycle test
 ```
 
 `nix fmt` formats the Nix files.
+
+A change in behavior comes with a scenario in `tests/vm/scenarios.sh`,
+and with updates to the reference (`docs/development/flake-sync.md`),
+the README, and the help text in `src/flake-sync`. The skills in
+`skills/` describe what the commands do; when to use them is the
+business of a workspace's instructions, so the skills hold no
+workspace policy.
 
 If you add a file, `git add` it before running a check. Nix evaluates the
 flake from the git tree, so an untracked file is invisible and the build
@@ -52,7 +61,7 @@ while developing a scenario:
 ```sh
 T=$(mktemp -d)
 HUB=$T/hub WORK=$T/workspace bash tests/vm/fixture.sh
-HUB=$T/hub WORK=$T/workspace FLAKE_SYNC=$PWD/pkg-overlays/default/packages/flake-sync/flake-sync \
+HUB=$T/hub WORK=$T/workspace FLAKE_SYNC=$PWD/src/flake-sync \
   bash tests/vm/scenarios.sh
 ```
 

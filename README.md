@@ -96,7 +96,7 @@ Full reference, including all flags, gotchas, and the test harness:
 
 ## Development
 
-The tool is `pkg-overlays/default/packages/flake-sync/flake-sync` (bash + jq),
+The tool is `src/flake-sync` (bash + jq),
 packaged with `writeShellApplication`, which shellchecks it at build
 time. `nix flake check` builds the package and an offline NixOS VM test
 (`tests/vm/`) that drives the packaged executable through a full

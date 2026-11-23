@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: MIT
 #
-# Agent skills for working in a flake-sync workspace, one directory per
-# skill with a SKILL.md, in the Agent Skills format.
+# Agent skills for working in a flake-sync workspace: the directories of
+# skills/, one per skill with a SKILL.md, in the Agent Skills format.
 # Each skill carries the flake-sync reference as reference.md, the file
 # its SKILL.md points into, so the reference has one source:
 # docs/development/flake-sync.md. In the repo, reference.md is a relative
@@ -26,7 +26,7 @@ runCommand "flake-sync-skills"
   (
     lib.concatMapStrings (skill: ''
       mkdir -p "$out/${skill}"
-      cp ${./${skill}/SKILL.md} "$out/${skill}/SKILL.md"
+      cp ${../../../../skills + "/${skill}/SKILL.md"} "$out/${skill}/SKILL.md"
       cp ${../../../../docs/development/flake-sync.md} "$out/${skill}/reference.md"
     '') skills
   )
